@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 const DEFAULT_CDP = "http://127.0.0.1:9222";
@@ -10,6 +11,7 @@ const DEFAULT_SESSION = "https://www.dola.com/chat/38415631468262161";
 const DOLA_CHAT_HOME = "https://www.dola.com/chat";
 const DOLA_IMAGE_HOME = "https://www.dola.com/chat/create-image";
 const DEFAULT_OUT_DIR = "downloads";
+const DEFAULT_SESSION_STATE = ".dola-cli-session.json";
 
 class DolaCliError extends Error {
   constructor(code, message, details = {}) {
@@ -44,15 +46,24 @@ Demos:
 Options:
   --session <url|id>       Existing Dola chat URL/id, or ${DOLA_CHAT_HOME}.
   --new-chat               Start at ${DOLA_CHAT_HOME}.
+  --resume                 Resume a batch from saved state/output files.
+  --session-state <path>   Session/state file. Default: ${DEFAULT_SESSION_STATE}
+  --account-pool <path>    JSON file of logged-in account/CDP entries to rotate.
   --prompt <text>          Prompt to submit. If omitted, the CLI asks interactively.
   --prompt-file <path>     Read prompt from a UTF-8 text file.
   --batch-prompt-file <path>
                            Generate images for each non-empty line in a UTF-8 text file.
+  --character-image <path> Fixed character reference image for batch generation.
+  --character-prompt <text>
+                           Prompt describing the fixed character reference image.
+  --character-batch-size <n>
+                           Re-upload the character image every n prompts. Default: 10
   --file <path>            Attach a local file before submitting. Can be repeated.
   --attach <path>          Alias for --file.
   --cdp <url>              Chrome CDP endpoint. Default: ${DEFAULT_CDP}
   --timeout <ms>           Max wait time after submit. Default: 120000
   --stable <ms>            Response text stability window. Default: 3000
+  --max-retries <n>        Automatic retries after timeout/submit failure. Default: 2
   --image-gen              Enable Dola image generation and download images from the last reply only.
   --out <path>             Image download directory. Default: ${DEFAULT_OUT_DIR}
   --count <n>              Number of images to download. Default: 1
@@ -66,15 +77,18 @@ Options:
 
 Image generation errors (non-zero exit):
   IMAGE_GENERATION_QUOTA_EXHAUSTED  The last reply indicates quota or usage exhaustion.
+  ACCOUNT_RESTRICTED                The last reply indicates the account is restricted.
   IMAGE_GENERATION_REFUSED          The last reply indicates generation was refused.
   IMAGE_GENERATION_TEXT_RESPONSE    The last reply is text instead of an image.
   IMAGE_GENERATION_TIMEOUT          No image appeared in the last reply before timeout.
   IMAGE_GENERATION_NO_CLEAN_IMAGE   Only non-raw/watermarked image URLs were available.
+  IMAGE_GENERATION_DUPLICATE_HASH   A downloaded image duplicated an earlier image.
+  ACCOUNT_POOL_EXHAUSTED             Every account is restricted for today.
 `);
 }
 
 function parseArgs(argv) {
-  const args = { cdp: DEFAULT_CDP, out: DEFAULT_OUT_DIR, count: 1, timeout: 120000, stable: 3000, files: [] };
+  const args = { cdp: DEFAULT_CDP, out: DEFAULT_OUT_DIR, count: 1, timeout: 120000, stable: 3000, maxRetries: 2, files: [] };
   for (let i = 2; i < argv.length; i += 1) {
     const arg = argv[i];
     const value = () => {
@@ -85,16 +99,23 @@ function parseArgs(argv) {
     if (arg === "-h" || arg === "--help") args.help = true;
     else if (arg === "--session") args.session = value();
     else if (arg === "--new-chat") args.newChat = true;
+    else if (arg === "--resume") args.resume = true;
+    else if (arg === "--session-state") args.sessionState = value();
+    else if (arg === "--account-pool") args.accountPool = value();
     else if (arg === "--image-gen" || arg === "--image-generation") args.imageGen = true;
     else if (arg === "--prompt") args.prompt = value();
     else if (arg === "--prompt-file") args.promptFile = value();
     else if (arg === "--batch-prompt-file") args.batchPromptFile = value();
+    else if (arg === "--character-image") args.characterImage = value();
+    else if (arg === "--character-prompt") args.characterPrompt = value();
+    else if (arg === "--character-batch-size") args.characterBatchSize = Number(value());
     else if (arg === "--file" || arg === "--attach") args.files.push(value());
     else if (arg === "--cdp") args.cdp = value();
     else if (arg === "--out") args.out = value();
     else if (arg === "--count") args.count = Number(value());
     else if (arg === "--timeout") args.timeout = Number(value());
     else if (arg === "--stable") args.stable = Number(value());
+    else if (arg === "--max-retries") args.maxRetries = Number(value());
     else if (arg === "--no-wait") args.noWait = true;
     else if (arg === "--no-download") args.noDownload = true;
     else if (arg === "--allow-watermark") args.allowWatermark = true;
@@ -106,11 +127,24 @@ function parseArgs(argv) {
   if (!Number.isFinite(args.count) || args.count < 1) throw new Error("--count must be a positive number.");
   if (!Number.isFinite(args.timeout) || args.timeout < 1000) throw new Error("--timeout must be at least 1000.");
   if (!Number.isFinite(args.stable) || args.stable < 500) throw new Error("--stable must be at least 500.");
+  if (!Number.isInteger(args.maxRetries) || args.maxRetries < 0) throw new Error("--max-retries must be a non-negative integer.");
+  if (args.characterBatchSize !== undefined && (!Number.isInteger(args.characterBatchSize) || args.characterBatchSize < 1)) {
+    throw new Error("--character-batch-size must be a positive integer.");
+  }
+  const hasCharacterOption = Boolean(args.characterImage || args.characterPrompt || args.characterBatchSize !== undefined);
+  if (hasCharacterOption) {
+    if (!args.characterImage || !args.characterPrompt) throw new Error("--character-image and --character-prompt are both required for fixed-character batch generation.");
+    if (!args.batchPromptFile) throw new Error("--character-image and --character-prompt require --batch-prompt-file.");
+    if (args.count !== 1) throw new Error("Fixed-character batch generation only supports one image per prompt; omit --count or use --count 1.");
+    args.characterBatchSize ??= 10;
+    args.imageGen = true;
+  }
   if (args.batchPromptFile) {
     if (args.prompt || args.promptFile) throw new Error("--batch-prompt-file cannot be combined with --prompt or --prompt-file.");
     if (args.noWait) throw new Error("--batch-prompt-file cannot be combined with --no-wait.");
     args.imageGen = true;
   }
+  if (args.resume && !args.batchPromptFile) throw new Error("--resume requires --batch-prompt-file.");
   return args;
 }
 
@@ -167,10 +201,162 @@ async function loadBatchPrompts(file) {
   const prompts = text
     .replace(/^\uFEFF/, "")
     .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(Boolean);
+    .map((line, index) => ({ text: line.trim(), line: index + 1 }))
+    .filter(item => item.text);
   if (!prompts.length) throw new Error(`No non-empty prompts found in batch file: ${file}`);
   return prompts;
+}
+
+async function readJsonFile(file) {
+  try {
+    return JSON.parse(await readFile(file, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new Error(`Could not read JSON state file ${file}: ${error.message}`);
+  }
+}
+
+function accountDayKey(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+async function loadAccountPool(file) {
+  const absoluteFile = path.resolve(file);
+  try {
+    const directoryEntries = await readdir(absoluteFile, { withFileTypes: true });
+    const cookieFiles = directoryEntries
+      .filter(entry => entry.isFile() && /\.(txt|cookies?|json)$/i.test(entry.name))
+      .map(entry => path.join(absoluteFile, entry.name))
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (!cookieFiles.length) throw new Error(`No cookie files found in account pool directory: ${file}`);
+    return cookieFiles.map((cookieFile, index) => ({
+      id: path.basename(cookieFile, path.extname(cookieFile)) || `account-${index + 1}`,
+      cdp: DEFAULT_CDP,
+      session: "",
+      cookieFile,
+    }));
+  } catch (error) {
+    if (error?.code !== "ENOTDIR") throw error;
+  }
+  const value = await readJsonFile(file);
+  const entries = Array.isArray(value) ? value : value?.accounts;
+  if (!Array.isArray(entries) || !entries.length) {
+    throw new Error(`Account pool must contain a non-empty JSON array or {"accounts": [...]}: ${file}`);
+  }
+  const accounts = entries.map((entry, index) => {
+    if (!entry || typeof entry !== "object") throw new Error(`Account pool entry ${index + 1} must be an object.`);
+    const id = String(entry.id || entry.name || `account-${index + 1}`).trim();
+    if (!id) throw new Error(`Account pool entry ${index + 1} has an empty id.`);
+    const cdp = String(entry.cdp || DEFAULT_CDP).trim();
+    const session = entry.session ? normalizeSession(entry.session) : "";
+    const cookieFile = entry.cookieFile || entry.cookies || entry.cookie
+      ? path.resolve(String(entry.cookieFile || entry.cookies || entry.cookie))
+      : "";
+    if (!cdp) throw new Error(`Account pool entry ${id} has an empty cdp endpoint.`);
+    return { id, cdp, session, cookieFile };
+  });
+  const ids = new Set();
+  for (const account of accounts) {
+    if (ids.has(account.id)) throw new Error(`Duplicate account id in pool: ${account.id}`);
+    ids.add(account.id);
+  }
+  return accounts;
+}
+
+async function loadNetscapeCookies(file) {
+  const text = await readFile(file, "utf8");
+  if (file.toLowerCase().endsWith(".json")) {
+    const value = JSON.parse(text);
+    const entries = Array.isArray(value) ? value : value.cookies;
+    if (!Array.isArray(entries)) throw new Error(`Cookie JSON must be an array or contain cookies: ${file}`);
+    return entries.map(cookie => ({ ...cookie }));
+  }
+  return text.split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line && (!line.startsWith("#") || line.startsWith("#HttpOnly_")))
+    .map(line => ({ httpOnly: line.startsWith("#HttpOnly_"), parts: (line.startsWith("#HttpOnly_") ? line.slice("#HttpOnly_".length) : line).split("\t") }))
+    .filter(item => item.parts.length >= 7)
+    .map(({ parts, httpOnly }) => {
+      const [domain, includeSubdomains, cookiePath, secure, expires, name, value] = parts;
+      return {
+        domain,
+        path: cookiePath || "/",
+        secure: String(secure).toUpperCase() === "TRUE",
+        ...(Number(expires) > 0 ? { expires: Number(expires) } : {}),
+        name,
+        value,
+        httpOnly,
+        sameSite: "Lax",
+        includeSubdomains: String(includeSubdomains).toUpperCase() === "TRUE",
+      };
+    });
+}
+
+async function applyAccountCookies(client, account) {
+  if (!account?.cookieFile) return;
+  const cookies = await loadNetscapeCookies(account.cookieFile);
+  if (!cookies.length) throw new Error(`No cookies found in account file: ${account.cookieFile}`);
+  await client.send("Network.clearBrowserCookies");
+  await client.send("Network.setCookies", { cookies });
+  console.log(`[dola-cli] loaded ${cookies.length} cookie(s) for account ${account.id}`);
+}
+
+function restrictedAccountSet(savedState, day) {
+  const values = savedState?.restrictedAccounts?.[day];
+  return new Set(Array.isArray(values) ? values.map(String) : []);
+}
+
+function chooseAccount(accounts, restricted, preferredId = "") {
+  const preferred = accounts.find(account => account.id === preferredId && !restricted.has(account.id));
+  const next = preferred || accounts.find(account => !restricted.has(account.id));
+  if (!next) {
+    throw new DolaCliError(
+      "ACCOUNT_POOL_EXHAUSTED",
+      "All accounts in the pool are restricted for today.",
+      { day: accountDayKey(), restrictedAccounts: [...restricted] }
+    );
+  }
+  return next;
+}
+
+function accountStateFields(accountPoolFile, activeAccount, restricted) {
+  if (!accountPoolFile) return {};
+  return {
+    accountPoolFile: path.resolve(accountPoolFile),
+    accountId: activeAccount?.id || "",
+    restrictedAccounts: { [accountDayKey()]: [...restricted].sort() },
+  };
+}
+
+async function writeJsonFile(file, value) {
+  await mkdir(path.dirname(file), { recursive: true });
+  const tempFile = `${file}.${process.pid}.tmp`;
+  await writeFile(tempFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await rename(tempFile, file);
+}
+
+async function inferCompletedOutput(outDir) {
+  const completed = [];
+  let names = [];
+  try {
+    names = await readdir(outDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") return completed;
+    throw error;
+  }
+  for (const name of names) {
+    const match = /^(\d+),([a-f0-9]{12})\.(png|jpe?g|webp|gif)$/i.exec(name);
+    if (!match) continue;
+    const file = path.resolve(outDir, name);
+    const bytes = await readFile(file);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    completed.push({ line: Number(match[1]), hash, shortHash: hash.slice(0, 12), file });
+  }
+  return completed;
 }
 
 async function normalizeFiles(files) {
@@ -356,13 +542,20 @@ async function findOrCreateTarget(cdp, sessionUrl, forceNew = false) {
   if (!forceNew) {
     const exact = targets.find(item => item.type === "page" && item.url === sessionUrl);
     if (exact) return exact;
-    const dolaChat = targets.find(item => item.type === "page" && /dola\.com\/chat/i.test(item.url));
-    if (dolaChat) return dolaChat;
   }
 
   const createPath = `/json/new?${encodeURIComponent(sessionUrl)}`;
   const created = await fetch(cdpHttpUrl(cdp, createPath), { method: "PUT" })
     .then(r => r.ok ? r.json() : fetch(cdpHttpUrl(cdp, createPath)).then(rr => rr.json()));
+  const otherDolaPages = targets.filter(item =>
+    item.type === "page"
+    && item.id !== created.id
+    && /(^|\.)dola\.com\//i.test(item.url || "")
+  );
+  await Promise.all(otherDolaPages.map(item =>
+    fetch(cdpHttpUrl(cdp, `/json/close/${encodeURIComponent(item.id)}`)).catch(() => null)
+  ));
+  if (otherDolaPages.length) console.log(`[dola-cli] closed ${otherDolaPages.length} other Dola tab(s)`);
   return created;
 }
 
@@ -934,10 +1127,21 @@ function messageIdFromRecord(item) {
 
 function classifyImageGenerationTextError(text) {
   const value = String(text || "").trim();
+  if (/账号受限|账户受限|账号封禁|账户封禁|account.*(?:restricted|suspended|disabled)|too many requests|rate limit/i.test(value)) {
+    return "ACCOUNT_RESTRICTED";
+  }
   if (/quota|limit|credits?|配额|额度|次数|今日.*用完|已用完|上限|限制|用尽/i.test(value)) return "IMAGE_GENERATION_QUOTA_EXHAUSTED";
   if (/无法生成|不能生成|生成不了|拒绝|不支持|违规|安全|policy|cannot|can't|unable|refus/i.test(value)) return "IMAGE_GENERATION_REFUSED";
   if (value) return "IMAGE_GENERATION_TEXT_RESPONSE";
   return "IMAGE_GENERATION_NO_IMAGE";
+}
+
+function isAccountRestrictedError(error) {
+  return ["ACCOUNT_RESTRICTED", "IMAGE_GENERATION_QUOTA_EXHAUSTED"].includes(error?.code);
+}
+
+function looksLikeImageGenerationProgress(text) {
+  return /generate(?:d|ing)?\s+image|will\s+generate|starting\s+to\s+generate|generating|正在生成|生成中|开始生成|即将生成|请稍候|请稍等|稍等/i.test(String(text || ""));
 }
 
 function looksLikePromptEcho(text, promptText) {
@@ -963,6 +1167,10 @@ function recordMatchesLastReply(item, lastReply) {
 function chooseDownloadItems(records, beforeUrls, options) {
   const fresh = uniqueImageRecords(records)
     .filter(item => !beforeUrls.has(item.url))
+    .filter(item => {
+      const key = normalizeImageKey(item.key || item.url);
+      return !key || !options.beforeImageKeys?.has(key);
+    })
     .filter(item => recordMatchesLastReply(item, options.lastReply));
   const rawByKey = new Map();
   for (const item of fresh) {
@@ -977,7 +1185,7 @@ function chooseDownloadItems(records, beforeUrls, options) {
   const clean = resolved.filter(item => !item.watermarked);
   const generated = clean.filter(item => item.key || /rc_gen_image/i.test(item.url));
   const preferred = clean.filter(item => item.raw);
-  const fallbackAny = options.allowWatermark ? resolved : [];
+  const fallbackAny = options.allowWatermark || options.watermarkFallback ? resolved : [];
   // Sort generated candidates by message id descending so the most recent image wins
   const sortByRecent = items => [...items].sort((a, b) => messageIdFromRecord(b) - messageIdFromRecord(a));
   const ordered = [
@@ -990,22 +1198,107 @@ function chooseDownloadItems(records, beforeUrls, options) {
   return uniqueImageRecords(ordered).slice(0, options.count);
 }
 
+async function imageGenerationUiSnapshot(client) {
+  return evaluate(client, `(() => {
+    const visible = el => {
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const attrs = el => Array.from(el.attributes || [])
+      .filter(attr => /load|busy|generat|pending|stream|state|status/i.test(attr.name))
+      .map(attr => [attr.name, attr.value]);
+    const loading = Array.from(document.querySelectorAll("[data-loading='true'], [aria-busy='true'], [data-generating='true'], [data-pending='true']"))
+      .filter(visible)
+      .map(el => ({ tag: el.tagName, id: el.id || "", className: String(el.className || "").slice(0, 160), attrs: attrs(el) }))
+      .slice(0, 20);
+    const messageNodes = Array.from(document.querySelectorAll("[data-message-id], [data-messageid], [data-testid*='message' i], [class*='message' i], [class*='answer' i], [class*='assistant' i], article"))
+      .filter(visible)
+      .map(el => ({
+        id: el.getAttribute("data-message-id") || el.getAttribute("data-messageid") || el.id || "",
+        className: String(el.className || "").slice(0, 180),
+        role: el.getAttribute("data-role") || el.getAttribute("data-message-role") || "",
+        children: el.childElementCount,
+        images: el.querySelectorAll("img[alt='image'][data-track-key]").length,
+      }));
+    const assistantNodes = messageNodes.filter(item => /assistant|answer|bot|ai/i.test(item.className + " " + item.role));
+    const send = document.querySelector("#flow-end-msg-send");
+    const input = Array.from(document.querySelectorAll("textarea, input[type='text'], [contenteditable='true'], [role='textbox']"))
+      .filter(visible).at(-1);
+    return {
+      loading,
+      busy: loading.length > 0,
+      messageCount: messageNodes.length,
+      assistantCount: assistantNodes.length,
+      assistantShape: assistantNodes.slice(-3),
+      generatedImageCount: document.querySelectorAll("img[alt='image'][data-track-key]").length,
+      send: send ? { disabled: Boolean(send.disabled), ariaDisabled: send.getAttribute("aria-disabled") || "", loading: send.getAttribute("data-loading") || "" } : null,
+      inputEmpty: !input || !(input.value || input.innerText || input.textContent || "").trim(),
+    };
+  })()`);
+}
+
+async function waitForImageGenerationComplete(client, options) {
+  const started = Date.now();
+  const before = options.beforeGenerationUi || await imageGenerationUiSnapshot(client);
+  let activitySeen = false;
+  let lastShape = "";
+  let lastShapeChange = Date.now();
+  while (Date.now() - started < options.timeout) {
+    const state = await imageGenerationUiSnapshot(client).catch(() => null);
+    if (!state) {
+      await sleep(1000);
+      continue;
+    }
+    const shape = JSON.stringify({
+      loading: state.loading,
+      messageCount: state.messageCount,
+      assistantCount: state.assistantCount,
+      assistantShape: state.assistantShape,
+      generatedImageCount: state.generatedImageCount,
+      send: state.send,
+    });
+    if (shape !== lastShape) {
+      lastShape = shape;
+      lastShapeChange = Date.now();
+    }
+    const responseNodeAdded = state.assistantCount > (before?.assistantCount || 0)
+      || state.generatedImageCount > (before?.generatedImageCount || 0);
+    const messageAdded = state.messageCount >= (before?.messageCount || 0) + 2;
+    if (state.busy || responseNodeAdded || messageAdded) activitySeen = true;
+    const stable = Date.now() - lastShapeChange >= options.stable;
+    const noLongerBusy = !state.busy;
+    if (activitySeen && noLongerBusy && stable) {
+      console.log(`[dola-cli] image generation UI complete (busy=${state.busy}, assistants=${state.assistantCount}, images=${state.generatedImageCount})`);
+      return state;
+    }
+    await sleep(1000);
+  }
+  throw new DolaCliError("IMAGE_GENERATION_TIMEOUT", `Timed out after ${options.timeout}ms waiting for Dola image generation to finish.`);
+}
+
 async function waitForDownloadItems(client, beforeUrls, capturedRecords, options) {
+  await waitForImageGenerationComplete(client, options);
   const started = Date.now();
   let lastChange = Date.now();
   let lastCount = 0;
-  let lastReply = options.beforeLastReply || null;
+  // Anchor the reply once generation is complete. Dola can reorder/virtualize
+  // old message nodes while raw URLs arrive, which must not change the scope.
+  const anchoredReply = await lastReplySnapshot(client);
+  let lastReply = anchoredReply;
   let lastReplyChange = Date.now();
   while (Date.now() - started < options.timeout) {
+    if (!lastReply?.imageKeys?.length) {
+      const replyWithImages = await lastReplySnapshot(client);
+      if (replyWithImages?.imageKeys?.length) {
+        lastReply = replyWithImages;
+        lastReplyChange = Date.now();
+        console.log(`[dola-cli] anchored last reply images=${lastReply.imageKeys.length} messageId=${lastReply.messageId || "unknown"}`);
+      }
+    }
     capturedRecords.push(...await collectHookImages(client));
     capturedRecords.push(...await collectDomImages(client));
-    const reply = await lastReplySnapshot(client);
-    const replyChanged = reply.signature && reply.signature !== lastReply?.signature;
-    if (replyChanged) {
-      lastReply = reply;
-      lastReplyChange = Date.now();
-      console.log(`[dola-cli] last reply changed (text=${reply.text.length}, images=${reply.imageKeys.length}, messageId=${reply.messageId || "unknown"})`);
-    }
     const scopedOptions = { ...options, lastReply };
     const selected = chooseDownloadItems(capturedRecords, beforeUrls, scopedOptions);
     const freshRecords = uniqueImageRecords(capturedRecords).filter(item => !beforeUrls.has(item.url));
@@ -1027,7 +1320,9 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
       && Date.now() - lastReplyChange >= options.stable;
     if (replyIsFinalText) {
       const code = classifyImageGenerationTextError(lastReply.text);
-      if (!looksLikePromptEcho(lastReply.text, options.promptText)) {
+      const progressOnly = code === "IMAGE_GENERATION_TEXT_RESPONSE"
+        && looksLikeImageGenerationProgress(lastReply.text);
+      if (!looksLikePromptEcho(lastReply.text, options.promptText) && !progressOnly) {
         throw new DolaCliError(code, `Image generation returned text instead of images: ${lastReply.text.slice(0, 300)}`, { lastReply });
       }
     }
@@ -1041,13 +1336,15 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
   const reply = scopedOptions.lastReply;
   if (reply?.signature && reply.signature !== options.beforeLastReply?.signature && !reply.imageKeys?.length && reply.text) {
     const code = classifyImageGenerationTextError(reply.text);
-    if (!looksLikePromptEcho(reply.text, options.promptText)) {
+    const progressOnly = code === "IMAGE_GENERATION_TEXT_RESPONSE"
+      && looksLikeImageGenerationProgress(reply.text);
+    if (!looksLikePromptEcho(reply.text, options.promptText) && !progressOnly) {
       throw new DolaCliError(code, `Image generation returned text instead of images: ${reply.text.slice(0, 300)}`, { lastReply: reply });
     }
   }
   throw new DolaCliError(
-    options.allowWatermark ? "IMAGE_GENERATION_TIMEOUT" : "IMAGE_GENERATION_NO_CLEAN_IMAGE",
-    options.allowWatermark
+    options.allowWatermark || options.watermarkFallback ? "IMAGE_GENERATION_TIMEOUT" : "IMAGE_GENERATION_NO_CLEAN_IMAGE",
+    options.allowWatermark || options.watermarkFallback
       ? `Timed out after ${options.timeout}ms without generated image URLs in the last reply.`
       : `Timed out after ${options.timeout}ms without clean/raw image URLs in the last reply. Use --allow-watermark to permit fallback URLs.`,
     { lastReply: reply || null }
@@ -1072,17 +1369,47 @@ async function downloadImages(items, outDir, options = {}) {
   const results = [];
   for (let i = 0; i < items.length; i += 1) {
     const item = items[i];
-    if (item.watermarked && !options.allowWatermark) throw new Error(`Refusing to download watermarked URL without --allow-watermark: ${item.url}`);
-    const response = await fetch(item.url, { headers: { "user-agent": "Mozilla/5.0" } });
-    if (!response.ok) throw new Error(`Download failed ${response.status}: ${item.url}`);
+    if (item.watermarked && !options.allowWatermark && !options.watermarkFallback) {
+      throw new Error(`Refusing to download watermarked URL without --allow-watermark: ${item.url}`);
+    }
+    let response;
+    let lastDownloadError;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        response = await fetch(item.url, { headers: { "user-agent": "Mozilla/5.0", accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8" } });
+        if (response.ok) break;
+        lastDownloadError = new Error(`Download failed ${response.status}: ${item.url}`);
+      } catch (error) {
+        lastDownloadError = error;
+      }
+      if (attempt < 3) {
+        console.log(`[dola-cli] image download retry ${attempt + 1}/3`);
+        await sleep(attempt * 1000);
+      }
+    }
+    if (!response?.ok) throw lastDownloadError || new Error(`Download failed: ${item.url}`);
     const ext = extensionFromUrl(item.url, response.headers.get("content-type"));
-    const stem = ["dola", item.conversation_id, item.message_id, item.key, item.raw ? "raw" : "clean", String(i + 1).padStart(2, "0")]
-      .filter(Boolean)
-      .map(part => safeFilePart(part, "item"))
-      .join("-");
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const shortHash = hash.slice(0, 12);
+    if (options.seenHashes?.has(hash)) {
+      const first = options.seenHashes.get(hash);
+      throw new DolaCliError(
+        "IMAGE_GENERATION_DUPLICATE_HASH",
+        `Downloaded image content duplicates an earlier image (hash ${shortHash}).`,
+        { hash, shortHash, line: options.lineNumber, firstLine: first?.line, firstFile: first?.file }
+      );
+    }
+    const stem = options.hashNaming
+      ? [safeFilePart(options.lineNumber, "line"), shortHash]
+      : ["dola", item.conversation_id, item.message_id, item.key, item.raw ? "raw" : "clean", String(i + 1).padStart(2, "0")]
+        .filter(Boolean)
+        .map(part => safeFilePart(part, "item"))
+        .join("-");
     const file = path.resolve(outDir, `${stem}.${ext}`);
-    await writeFile(file, Buffer.from(await response.arrayBuffer()));
-    results.push({ ...item, file });
+    await writeFile(file, bytes);
+    options.seenHashes?.set(hash, { line: options.lineNumber, file });
+    results.push({ ...item, file, hash, shortHash, line: options.lineNumber });
     console.log(`[dola-cli] saved ${file}`);
   }
   return results;
@@ -1262,51 +1589,117 @@ async function waitForResponseText(client, beforeTail, options) {
   return pageSnapshot(client);
 }
 
-async function main() {
-  const args = parseArgs(process.argv);
-  if (args.help) return usage();
+async function sendCharacterContext(client, imagePath, characterPrompt, options) {
+  const beforeGenerationUi = await imageGenerationUiSnapshot(client);
+  await clearImageHook(client);
+  await attachFiles(client, [imagePath]);
+  await submitPrompt(client, characterPrompt, options);
+  await waitForImageGenerationComplete(client, { ...options, beforeGenerationUi });
+  await sleep(500);
+}
 
-  if (args.newChat) args.session = args.imageGen ? DOLA_IMAGE_HOME : DOLA_CHAT_HOME;
-  if (!args.session) args.session = await askRequired(`Dola chat session URL or id (required, example ${DEFAULT_SESSION}): `);
-
-  const sessionUrl = normalizeSession(args.session);
-  const promptTexts = args.dryRun || args.debugUi || args.debugImages
-    ? []
-    : args.batchPromptFile
-      ? await loadBatchPrompts(args.batchPromptFile)
-      : [await loadPrompt(args)];
-  const files = args.dryRun || args.debugUi || args.debugImages ? [] : await normalizeFiles(args.files);
-  if (!args.dryRun && !args.debugUi && !args.debugImages && !promptTexts.length) throw new Error("prompt is required.");
-
-  console.log(`[dola-cli] connecting CDP ${args.cdp}`);
-  const target = await findOrCreateTarget(args.cdp, sessionUrl, args.newChat);
+async function openAccountSession(cdp, sessionUrl, forceNew, resume, account) {
+  const target = await findOrCreateTarget(cdp, sessionUrl, forceNew);
   if (!target?.webSocketDebuggerUrl) throw new Error("No page CDP target found.");
-
   const client = new CdpClient(target.webSocketDebuggerUrl);
   await client.connect();
   await client.send("Runtime.enable");
   await client.send("Page.enable");
   await client.send("Network.enable");
   await client.send("Page.bringToFront").catch(() => {});
+  await applyAccountCookies(client, account);
 
   let currentUrl = await evaluate(client, "location.href");
   if (currentUrl !== sessionUrl) {
+    console.log(`[dola-cli] navigating session ${currentUrl} -> ${sessionUrl}`);
     await client.send("Page.navigate", { url: sessionUrl });
+    await waitForPageReady(client);
+    await sleep(3000);
+    currentUrl = await evaluate(client, "location.href");
+    console.log(`[dola-cli] session ready ${currentUrl}`);
+  } else if (resume) {
+    console.log(`[dola-cli] refreshing resumed session ${sessionUrl}`);
+    await client.send("Page.reload", { ignoreCache: false });
     await waitForPageReady(client);
     await sleep(3000);
     currentUrl = await evaluate(client, "location.href");
   }
   await installImageHook(client);
+  return { client, currentUrl };
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  if (args.help) return usage();
+
+  const sessionStateFile = path.resolve(args.sessionState || DEFAULT_SESSION_STATE);
+  const savedState = await readJsonFile(sessionStateFile);
+  const accountPoolFile = args.accountPool ? path.resolve(args.accountPool) : "";
+  let accountPool = accountPoolFile ? await loadAccountPool(accountPoolFile) : [];
+  const accountDay = accountDayKey();
+  const restrictedAccounts = restrictedAccountSet(savedState, accountDay);
+  let activeAccount = accountPool.length
+    ? chooseAccount(accountPool, restrictedAccounts, savedState?.accountId || "")
+    : null;
+  if (activeAccount) {
+    args.cdp = activeAccount.cdp;
+    args.session = args.newChat ? DOLA_IMAGE_HOME : (activeAccount.session || args.session || savedState?.lastSessionUrl);
+  }
+  if (!args.session && !args.newChat && savedState?.lastSessionUrl) {
+    args.session = savedState.lastSessionUrl;
+    console.log(`[dola-cli] resuming remembered session ${args.session}`);
+  }
+  if (args.newChat) args.session = args.imageGen ? DOLA_IMAGE_HOME : DOLA_CHAT_HOME;
+  if (activeAccount && !args.newChat && !args.session) {
+    throw new Error(`Account ${activeAccount.id} needs a session URL, or use --new-chat.`);
+  }
+  if (!args.session) args.session = await askRequired(`Dola chat session URL or id (required, example ${DEFAULT_SESSION}): `);
+
+  let sessionUrl = normalizeSession(args.session);
+  const promptEntries = args.dryRun || args.debugUi || args.debugImages
+    ? []
+    : args.batchPromptFile
+      ? await loadBatchPrompts(args.batchPromptFile)
+      : [{ text: await loadPrompt(args), line: null }];
+  const files = args.dryRun || args.debugUi || args.debugImages ? [] : await normalizeFiles(args.files);
+  const characterImage = args.dryRun || args.debugUi || args.debugImages
+    ? []
+    : args.characterImage
+      ? await normalizeFiles([args.characterImage])
+      : [];
+  if (!args.dryRun && !args.debugUi && !args.debugImages && !promptEntries.length) throw new Error("prompt is required.");
+  const outputDir = path.resolve(args.out);
+  const inferredCompleted = args.resume ? await inferCompletedOutput(outputDir) : [];
+  const savedCompleted = args.resume && Array.isArray(savedState?.completed) ? savedState.completed : [];
+  const completedByLine = new Map();
+  for (const item of [...inferredCompleted, ...savedCompleted]) {
+    if (item?.line && item?.file) completedByLine.set(Number(item.line), item);
+  }
+  if (args.resume && savedState?.batchPromptFile && path.resolve(savedState.batchPromptFile) !== path.resolve(args.batchPromptFile)) {
+    throw new Error(`--resume state belongs to a different batch prompt file: ${savedState.batchPromptFile}`);
+  }
+  if (args.resume && savedState?.characterImage && path.resolve(savedState.characterImage) !== path.resolve(args.characterImage)) {
+    throw new Error(`--resume state belongs to a different character image: ${savedState.characterImage}`);
+  }
+  if (args.resume && savedState?.accountPoolFile && path.resolve(savedState.accountPoolFile) !== accountPoolFile) {
+    throw new Error(`--resume state belongs to a different account pool: ${savedState.accountPoolFile}`);
+  }
+
+  console.log(`[dola-cli] connecting CDP ${args.cdp}`);
+  const opened = await openAccountSession(args.cdp, sessionUrl, Boolean(args.newChat || activeAccount), args.resume, activeAccount);
+  let client = opened.client;
+  let currentUrl = opened.currentUrl;
+  const poolState = () => accountStateFields(accountPoolFile, activeAccount, restrictedAccounts);
 
   const before = await pageSnapshot(client);
   console.log(`[dola-cli] session ${currentUrl}`);
   if (args.debugUi) {
-    console.log(JSON.stringify(await uiSnapshot(client), null, 2));
+    console.log(JSON.stringify({ ui: await uiSnapshot(client), generation: await imageGenerationUiSnapshot(client) }, null, 2));
     client.close();
     return;
   }
   if (args.debugImages) {
-    console.log(JSON.stringify(await imageDebugSnapshot(client), null, 2));
+    console.log(JSON.stringify({ images: await imageDebugSnapshot(client), lastReply: await lastReplySnapshot(client) }, null, 2));
     client.close();
     return;
   }
@@ -1324,38 +1717,199 @@ async function main() {
   installNetworkImageCapture(client, capturedRecords);
 
   const results = [];
-  for (const [index, promptText] of promptTexts.entries()) {
-    await clearImageHook(client);
-    const beforeResponse = await pageSnapshot(client);
-    const beforeImageUrls = new Set([
-      ...(await collectHookImages(client)).map(item => item.url),
-      ...(await collectDomImages(client)).map(item => item.url),
-    ]);
-    const beforeLastReply = args.imageGen ? await lastReplySnapshot(client) : null;
-
-    if (args.batchPromptFile) console.log(`[dola-cli] batch prompt ${index + 1}/${promptTexts.length}`);
-    const submit = await submitPrompt(client, promptText, args);
-    console.log(`[dola-cli] submitted via ${submit.method} (${submit.selector})`);
-    const finalUrl = args.newChat || isChatHomeUrl(sessionUrl)
-      ? await waitForConcreteChatUrl(client, currentUrl)
-      : await evaluate(client, "location.href").catch(() => currentUrl);
-
-    const finalSnapshot = args.noWait || (args.imageGen && !args.noDownload)
-      ? await pageSnapshot(client)
-      : await waitForResponseText(client, beforeResponse.textTail || "", args);
-    const downloaded = args.imageGen && !args.noWait && !args.noDownload
-      ? await downloadImages(await waitForDownloadItems(client, beforeImageUrls, capturedRecords, { ...args, beforeLastReply, promptText }), path.resolve(args.out), args)
-      : [];
-
-    results.push({
-      index: index + 1,
-      finalUrl,
-      prompt: promptText,
-      submit,
-      downloaded,
-      page: finalSnapshot,
+  const seenHashes = new Map();
+  let forceCharacterContext = false;
+  const switchRestrictedAccount = async (error, lineNumber) => {
+    if (!accountPool.length || !activeAccount || !isAccountRestrictedError(error)) return false;
+    restrictedAccounts.add(activeAccount.id);
+    await writeJsonFile(sessionStateFile, {
+      ...(savedState || {}),
+      ...poolState(),
+      version: 1,
+      lastSessionUrl: currentUrl,
+      failedLine: lineNumber,
+      updatedAt: new Date().toISOString(),
     });
-    currentUrl = finalUrl;
+    if (accountPoolFile) accountPool = await loadAccountPool(accountPoolFile);
+    const nextAccount = chooseAccount(accountPool, restrictedAccounts, "");
+    console.log(`[dola-cli] account ${activeAccount.id} is restricted for ${accountDay}; switching to ${nextAccount.id}`);
+    client.close();
+    capturedRecords.length = 0;
+    activeAccount = nextAccount;
+    args.cdp = activeAccount.cdp;
+    sessionUrl = normalizeSession(args.newChat
+      ? DOLA_IMAGE_HOME
+      : (activeAccount.session || sessionUrl));
+    const nextOpened = await openAccountSession(args.cdp, sessionUrl, true, false, activeAccount);
+    client = nextOpened.client;
+    currentUrl = nextOpened.currentUrl;
+    await installImageHook(client);
+    installNetworkImageCapture(client, capturedRecords);
+    forceCharacterContext = Boolean(args.characterImage);
+    return true;
+  };
+  for (const [index, promptEntry] of promptEntries.entries()) {
+    const promptText = typeof promptEntry === "string" ? promptEntry : promptEntry.text;
+    const lineNumber = typeof promptEntry === "string" ? index + 1 : promptEntry.line;
+    const completed = completedByLine.get(lineNumber);
+    if (args.resume && completed?.file && await access(completed.file, fsConstants.R_OK).then(() => true).catch(() => false)) {
+      if (completed.hash) seenHashes.set(completed.hash, { line: lineNumber, file: completed.file });
+      console.log(`[dola-cli] resume skip line ${lineNumber}: ${completed.file}`);
+      results.push({ index: index + 1, line: lineNumber, prompt: promptText, skipped: true, downloaded: [{ ...completed }] });
+      continue;
+    }
+    let attempt = 0;
+    while (true) {
+      try {
+      const firstProcessedPrompt = results.every(item => item.skipped);
+      if (args.characterImage && (index % args.characterBatchSize === 0 || (args.newChat && firstProcessedPrompt) || attempt > 0 || forceCharacterContext)) {
+        console.log(`[dola-cli] refreshing character context before prompt ${index + 1}/${promptEntries.length}`);
+        await sendCharacterContext(client, characterImage[0], args.characterPrompt, args);
+        forceCharacterContext = false;
+      }
+
+      await clearImageHook(client);
+      const beforeResponse = await pageSnapshot(client);
+      const beforeImageRecords = [
+        ...capturedRecords,
+        ...(await collectHookImages(client)),
+        ...(await collectDomImages(client)),
+      ];
+      const beforeImageUrls = new Set(beforeImageRecords.map(item => item.url));
+      const beforeImageKeys = new Set(
+        beforeImageRecords
+          .map(item => normalizeImageKey(item.key || item.url))
+          .filter(Boolean)
+      );
+      const beforeGenerationUi = args.imageGen ? await imageGenerationUiSnapshot(client) : null;
+      capturedRecords.length = 0;
+
+      if (args.batchPromptFile) console.log(`[dola-cli] batch prompt ${lineNumber ?? index + 1}/${promptEntries.length}`);
+      const submit = await submitPrompt(client, promptText, args);
+      console.log(`[dola-cli] submitted via ${submit.method} (${submit.selector})`);
+      const finalUrl = args.newChat || isChatHomeUrl(sessionUrl)
+        ? await waitForConcreteChatUrl(client, currentUrl)
+        : await evaluate(client, "location.href").catch(() => currentUrl);
+      await writeJsonFile(sessionStateFile, {
+        ...(savedState || {}),
+        ...poolState(),
+        version: 1,
+        lastSessionUrl: finalUrl,
+        completed: [...completedByLine.values()].filter(item => item.line && item.file),
+        updatedAt: new Date().toISOString(),
+      });
+
+      const finalSnapshot = args.noWait || (args.imageGen && !args.noDownload)
+        ? await pageSnapshot(client)
+        : await waitForResponseText(client, beforeResponse.textTail || "", args);
+      const downloaded = args.imageGen && !args.noWait && !args.noDownload
+        ? await downloadImages(
+          await waitForDownloadItems(client, beforeImageUrls, capturedRecords, {
+            ...args,
+            beforeImageKeys,
+            beforeGenerationUi,
+            watermarkFallback: Boolean(args.characterImage),
+            promptText,
+          }),
+          path.resolve(args.out),
+          { ...args, lineNumber, hashNaming: Boolean(args.characterImage), watermarkFallback: Boolean(args.characterImage), seenHashes }
+        )
+        : [];
+
+      results.push({
+        index: index + 1,
+        line: lineNumber,
+        finalUrl,
+        prompt: promptText,
+        submit,
+        downloaded,
+        page: finalSnapshot,
+      });
+      for (const item of downloaded || []) {
+        if (lineNumber && item.file) {
+          completedByLine.set(Number(lineNumber), {
+            line: lineNumber,
+            hash: item.hash,
+            shortHash: item.shortHash,
+            file: item.file,
+            prompt: promptText,
+          });
+        }
+      }
+      if (args.batchPromptFile) {
+        const completedForState = new Map(completedByLine);
+        for (const item of results) {
+          for (const downloaded of item.downloaded || []) {
+            if (item.line && downloaded.file) {
+              completedForState.set(Number(item.line), {
+                line: item.line,
+                hash: downloaded.hash,
+                shortHash: downloaded.shortHash,
+                file: downloaded.file,
+                prompt: item.prompt,
+              });
+            }
+          }
+        }
+        const state = {
+          ...poolState(),
+          version: 1,
+          lastSessionUrl: finalUrl,
+          batchPromptFile: path.resolve(args.batchPromptFile),
+          characterImage: args.characterImage ? path.resolve(args.characterImage) : "",
+          characterPrompt: args.characterPrompt || "",
+          characterBatchSize: args.characterBatchSize || null,
+          completed: [...completedForState.values()]
+            .filter(item => item.line && item.file),
+          updatedAt: new Date().toISOString(),
+        };
+        await writeJsonFile(sessionStateFile, state);
+      } else {
+        await writeJsonFile(sessionStateFile, { ...poolState(), version: 1, lastSessionUrl: finalUrl, updatedAt: new Date().toISOString() });
+      }
+      currentUrl = finalUrl;
+      break;
+      } catch (error) {
+        if (await switchRestrictedAccount(error, lineNumber)) {
+          attempt = 0;
+          continue;
+        }
+        const retryable = args.batchPromptFile && [
+          "IMAGE_GENERATION_TIMEOUT",
+          "IMAGE_GENERATION_NO_CLEAN_IMAGE",
+          "DOLA_CLI_ERROR",
+          "ECONNRESET",
+        ].includes(error.code || "DOLA_CLI_ERROR");
+        if (retryable && attempt < args.maxRetries) {
+          attempt += 1;
+          console.log(`[dola-cli] retrying line ${lineNumber} (${attempt}/${args.maxRetries}) in a new Dola tab`);
+          client.close();
+          capturedRecords.length = 0;
+          const retryTarget = await findOrCreateTarget(args.cdp, DOLA_IMAGE_HOME, true);
+          client = new CdpClient(retryTarget.webSocketDebuggerUrl);
+          await client.connect();
+          await client.send("Runtime.enable");
+          await client.send("Page.enable");
+          await client.send("Network.enable");
+          await client.send("Page.bringToFront").catch(() => {});
+          currentUrl = await evaluate(client, "location.href").catch(() => DOLA_IMAGE_HOME);
+          await waitForPageReady(client);
+          await sleep(3000);
+          await installImageHook(client);
+          installNetworkImageCapture(client, capturedRecords);
+          continue;
+        }
+        if (args.characterImage) {
+          const details = { ...(error.details || {}), failedLine: lineNumber, failedPrompt: promptText };
+          if (error instanceof DolaCliError) {
+            error.details = details;
+          } else {
+            throw new DolaCliError(error.code || "DOLA_CLI_ERROR", error.message || String(error), details);
+          }
+        }
+        throw error;
+      }
+    }
   }
 
   const output = args.batchPromptFile
@@ -1364,12 +1918,27 @@ async function main() {
       attached,
       imageGeneration: true,
       batchPromptFile: path.resolve(args.batchPromptFile),
-      submitted: results.length,
+      ...(args.characterImage ? {
+        characterImage: path.resolve(args.characterImage),
+        characterBatchSize: args.characterBatchSize,
+      } : {}),
+      ...(accountPoolFile ? {
+        accountPoolFile,
+        accountId: activeAccount?.id || "",
+        restrictedAccounts: { [accountDay]: [...restrictedAccounts].sort() },
+      } : {}),
+      submitted: results.filter(item => !item.skipped).length,
+      skipped: results.filter(item => item.skipped).length,
       results,
     }
     : {
       sessionUrl,
       attached,
+      ...(accountPoolFile ? {
+        accountPoolFile,
+        accountId: activeAccount?.id || "",
+        restrictedAccounts: { [accountDay]: [...restrictedAccounts].sort() },
+      } : {}),
       submitted: true,
       imageGeneration: Boolean(args.imageGen),
       ...results[0],
