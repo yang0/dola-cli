@@ -11,6 +11,15 @@ const DOLA_CHAT_HOME = "https://www.dola.com/chat";
 const DOLA_IMAGE_HOME = "https://www.dola.com/chat/create-image";
 const DEFAULT_OUT_DIR = "downloads";
 
+class DolaCliError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = "DolaCliError";
+    this.code = code;
+    this.details = details;
+  }
+}
+
 function usage() {
   console.log(`dola-cli
 
@@ -20,6 +29,7 @@ through an existing Chrome session exposed on CDP port 9222.
 Usage:
   bun src/cli.js --session <dola-chat-url|id> --prompt <text> [options]
   bun src/cli.js --new-chat --prompt <text> [options]
+  bun src/cli.js --new-chat --batch-prompt-file <path> [options]
 
 Prerequisites:
   1. Start Chrome with --remote-debugging-port=9222.
@@ -36,15 +46,30 @@ Options:
   --new-chat               Start at ${DOLA_CHAT_HOME}.
   --prompt <text>          Prompt to submit. If omitted, the CLI asks interactively.
   --prompt-file <path>     Read prompt from a UTF-8 text file.
+  --batch-prompt-file <path>
+                           Generate images for each non-empty line in a UTF-8 text file.
   --file <path>            Attach a local file before submitting. Can be repeated.
   --attach <path>          Alias for --file.
   --cdp <url>              Chrome CDP endpoint. Default: ${DEFAULT_CDP}
   --timeout <ms>           Max wait time after submit. Default: 120000
   --stable <ms>            Response text stability window. Default: 3000
+  --image-gen              Enable Dola image generation and download images from the last reply only.
+  --out <path>             Image download directory. Default: ${DEFAULT_OUT_DIR}
+  --count <n>              Number of images to download. Default: 1
+  --no-download            Generate images without downloading them.
+  --allow-watermark        Permit watermarked image URLs when no raw URL is available.
   --no-wait                Submit only; do not wait for response text.
   --debug-ui               Print visible input/button candidates and exit.
+  --debug-images           Print captured image URLs and exit.
   --dry-run                Validate CDP/session only; do not submit a prompt.
   -h, --help               Show this help.
+
+Image generation errors (non-zero exit):
+  IMAGE_GENERATION_QUOTA_EXHAUSTED  The last reply indicates quota or usage exhaustion.
+  IMAGE_GENERATION_REFUSED          The last reply indicates generation was refused.
+  IMAGE_GENERATION_TEXT_RESPONSE    The last reply is text instead of an image.
+  IMAGE_GENERATION_TIMEOUT          No image appeared in the last reply before timeout.
+  IMAGE_GENERATION_NO_CLEAN_IMAGE   Only non-raw/watermarked image URLs were available.
 `);
 }
 
@@ -63,6 +88,7 @@ function parseArgs(argv) {
     else if (arg === "--image-gen" || arg === "--image-generation") args.imageGen = true;
     else if (arg === "--prompt") args.prompt = value();
     else if (arg === "--prompt-file") args.promptFile = value();
+    else if (arg === "--batch-prompt-file") args.batchPromptFile = value();
     else if (arg === "--file" || arg === "--attach") args.files.push(value());
     else if (arg === "--cdp") args.cdp = value();
     else if (arg === "--out") args.out = value();
@@ -80,6 +106,11 @@ function parseArgs(argv) {
   if (!Number.isFinite(args.count) || args.count < 1) throw new Error("--count must be a positive number.");
   if (!Number.isFinite(args.timeout) || args.timeout < 1000) throw new Error("--timeout must be at least 1000.");
   if (!Number.isFinite(args.stable) || args.stable < 500) throw new Error("--stable must be at least 500.");
+  if (args.batchPromptFile) {
+    if (args.prompt || args.promptFile) throw new Error("--batch-prompt-file cannot be combined with --prompt or --prompt-file.");
+    if (args.noWait) throw new Error("--batch-prompt-file cannot be combined with --no-wait.");
+    args.imageGen = true;
+  }
   return args;
 }
 
@@ -131,6 +162,17 @@ async function loadPrompt(args) {
   return askRequired("Prompt to submit: ");
 }
 
+async function loadBatchPrompts(file) {
+  const text = await readFile(file, "utf8");
+  const prompts = text
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  if (!prompts.length) throw new Error(`No non-empty prompts found in batch file: ${file}`);
+  return prompts;
+}
+
 async function normalizeFiles(files) {
   const resolved = [];
   for (const file of files || []) {
@@ -174,7 +216,10 @@ function isWatermarkedUrl(url) {
 }
 
 function isPreferredRawUrl(url) {
-  return /(image_raw|raw|origin|original|ori|source|large|no[_-]?watermark|without[_-]?watermark)/i.test(url || "") && !isWatermarkedUrl(url);
+  if (isWatermarkedUrl(url)) return false;
+  if (/(image_raw|raw|origin|original|ori|source|large|no[_-]?watermark|without[_-]?watermark)/i.test(url || "")) return true;
+  if (/rc_gen_image\/[a-f0-9]{16,64}\.(jpeg|jpg|png|webp)(\?|$)/i.test(url || "")) return true;
+  return false;
 }
 
 function imageKeyFromUrl(url) {
@@ -184,6 +229,10 @@ function imageKeyFromUrl(url) {
   if (!match) return "";
   const filename = match[1].includes(".") ? match[1] : `${match[1]}.jpeg`;
   return `rc_gen_image/${filename.replace(/preview\.(jpeg|jpg|png|webp)$/i, ".$1")}`;
+}
+
+function normalizeImageKey(value) {
+  return imageKeyFromUrl(value) || String(value || "").replace(/^\d+_\d+_/, "");
 }
 
 function collectImageUrls(value, found = new Set()) {
@@ -352,7 +401,8 @@ async function waitForConcreteChatUrl(client, initialUrl, timeoutMs = 60000) {
 
 async function ensureImageGenerationMode(client) {
   const state = await evaluate(client, `(() => {
-    const imageText = "\\u56fe\\u50cf\\u751f\\u6210";
+    const imageTexts = ["\\u56fe\\u50cf\\u751f\\u6210", "Create Image", "Image Generation"];
+    const imageRegex = /image.?gen|create.?image|image/i;
     if (/\\/chat\\/create-image/i.test(location.pathname)) return { ok: true, already: true };
     const visible = el => {
       const rect = el.getBoundingClientRect();
@@ -364,9 +414,14 @@ async function ensureImageGenerationMode(client) {
       const selected = el.getAttribute("aria-selected") === "true" || el.getAttribute("data-state") === "active";
       return selected || /active|selected|checked|primary|highlight/i.test(text);
     };
+    const matchesImage = el => {
+      const text = (el.innerText || el.textContent || "");
+      const allText = [text, el.getAttribute("aria-label"), el.title, el.className, el.id].join(" ");
+      return imageTexts.some(t => text.includes(t)) || imageRegex.test(allText);
+    };
     const activeButton = Array.from(document.querySelectorAll("button, [role='button']"))
       .filter(visible)
-      .find(el => ((el.innerText || el.textContent || "").includes(imageText) || /image.?gen|create.?image/i.test([el.innerText, el.textContent, el.className, el.id].join(" "))) && isActive(el));
+      .find(el => matchesImage(el) && isActive(el));
     if (activeButton) return { ok: true, already: true };
 
     const candidates = [
@@ -376,9 +431,10 @@ async function ensureImageGenerationMode(client) {
       .map(el => {
         const rect = el.getBoundingClientRect();
         const text = [el.innerText, el.textContent, el.getAttribute("aria-label"), el.title, el.className, el.id].join(" ");
+        const plain = (el.innerText || el.textContent || "");
         let score = 0;
-        if ((el.innerText || el.textContent || "").includes(imageText)) score += 200;
-        if (/image.?gen|create.?image|image/i.test(text)) score += 120;
+        if (imageTexts.some(t => plain.includes(t))) score += 200;
+        if (imageRegex.test(text)) score += 120;
         if (rect.y > window.innerHeight * 0.55) score += 20;
         return { el, score, rect, text: text.trim().slice(0, 120) };
       })
@@ -396,7 +452,7 @@ async function ensureImageGenerationMode(client) {
   }
 
   const switched = await evaluate(client, `(() => new Promise(resolve => {
-    const imageText = "\\u56fe\\u50cf\\u751f\\u6210";
+    const imageTexts = ["\\u56fe\\u50cf\\u751f\\u6210", "Create Image", "Image Generation"];
     const visible = el => {
       const rect = el.getBoundingClientRect();
       const style = getComputedStyle(el);
@@ -405,9 +461,9 @@ async function ensureImageGenerationMode(client) {
     const check = () => {
       if (/\\/chat\\/create-image/i.test(location.pathname)) return true;
       const buttons = Array.from(document.querySelectorAll("button, [role='button']")).filter(visible);
-      const matching = buttons.filter(el => (el.innerText || el.textContent || "").includes(imageText));
+      const matching = buttons.filter(el => imageTexts.some(t => (el.innerText || el.textContent || "").includes(t)));
       const active = matching.some(el => {
-        const text = [el.className, el.getAttribute("aria-selected"), el.getAttribute("data-state")].join(" ");
+        const text = [el.innerText, el.textContent, el.className, el.getAttribute("aria-selected"), el.getAttribute("data-state")].join(" ");
         return /active|selected|checked|primary|highlight|true/i.test(text);
       });
       return active;
@@ -531,21 +587,22 @@ async function submitPrompt(client, promptText, options = {}) {
     ]);
     if (!input) return { ok: false, error: "No visible Dola input box found." };
     input.el.focus();
-    if (input.el.tagName === "TEXTAREA" || input.el.tagName === "INPUT") {
-      const proto = input.el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
-      descriptor?.set?.call(input.el, "");
-    } else {
-      input.el.textContent = "";
-    }
-    input.el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+    // Clear any leftover text by selecting all and deleting through real keyboard events.
+    input.el.setSelectionRange && input.el.setSelectionRange(0, input.el.value ? input.el.value.length : 0);
     const rect = input.el.getBoundingClientRect();
-    return { ok: true, selector: input.selector, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    return { ok: true, selector: input.selector, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, tagName: input.el.tagName };
   })()`);
 
   if (!inputInfo?.ok) throw new Error(inputInfo?.error || "No visible Dola input box found.");
   await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: inputInfo.x, y: inputInfo.y, button: "left", clickCount: 1 });
   await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: inputInfo.x, y: inputInfo.y, button: "left", clickCount: 1 });
+  // Select all then delete to clear leftover content.
+  await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 65, code: "KeyA", key: "a", modifiers: 2 });
+  await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 65, code: "KeyA", key: "a", modifiers: 2 });
+  await sleep(100);
+  await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 46, code: "Delete", key: "Delete" });
+  await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 46, code: "Delete", key: "Delete" });
+  await sleep(100);
   await client.send("Input.insertText", { text: promptText });
   await syncInputText(client, promptText);
   if (options.imageGen) {
@@ -713,16 +770,37 @@ async function collectHookImages(client) {
   return Array.isArray(records) ? uniqueImageRecords(records) : [];
 }
 
+function rawUrlFromTrackKey(trackKey, origin) {
+  if (!trackKey || !origin) return "";
+  const path = String(trackKey).replace(/^\d+_\d+_/, "");
+  if (!path) return "";
+  try {
+    return new URL(path, origin).href;
+  } catch {
+    return "";
+  }
+}
+
 async function collectDomImages(client) {
   const urls = await evaluate(client, `(() => {
     const out = Array.from(document.querySelectorAll('img[alt="image"][data-track-key]'))
       .filter(img => img.naturalWidth >= 256 && img.naturalHeight >= 256)
-      .map(img => ({
-        url: img.currentSrc || img.src || "",
-        key: img.getAttribute("data-track-key") || "",
-        width: img.naturalWidth,
-        height: img.naturalHeight,
-      }));
+      .map(img => {
+        const src = img.currentSrc || img.src || "";
+        const key = img.getAttribute("data-track-key") || "";
+        const rawUrl = (() => {
+          if (!key || !src) return "";
+          const path = key.replace(/^\d+_\d+_/, "");
+          if (!path) return "";
+          try { return new URL(path, new URL(src).origin).href; } catch { return ""; }
+        })();
+        return {
+          url: rawUrl || src,
+          key: key,
+          width: img.naturalWidth,
+          height: img.naturalHeight,
+        };
+      });
     return out;
   })()`).catch(() => []);
   return uniqueImageRecords((urls || []).filter(item => isLikelyImageUrl(item.url)).map(item => ({
@@ -735,22 +813,180 @@ async function collectDomImages(client) {
   })));
 }
 
+async function lastReplySnapshot(client) {
+  const snapshot = await evaluate(client, `(() => {
+    const visible = el => {
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const rectOf = el => {
+      const rect = el.getBoundingClientRect();
+      return { top: rect.top, bottom: rect.bottom, height: rect.height, width: rect.width, area: rect.width * rect.height };
+    };
+    const textOf = el => (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+    const inputBoxes = Array.from(document.querySelectorAll("textarea, input[type='text'], [contenteditable='true'], [role='textbox']")).filter(visible);
+    const composerTop = inputBoxes.length ? Math.min(...inputBoxes.map(el => el.getBoundingClientRect().top)) : Number.POSITIVE_INFINITY;
+    const generatedImageSelector = 'img[alt="image"][data-track-key]';
+    const messageSelector = [
+      "[data-message-id]",
+      "[data-testid*='message' i]",
+      "[class*='message' i]",
+      "[class*='chat-item' i]",
+      "[class*='bubble' i]",
+      "[class*='answer' i]",
+      "[class*='assistant' i]",
+      "article"
+    ].join(",");
+    const isUiChrome = el => {
+      const tag = el.tagName;
+      if (["BUTTON", "NAV", "HEADER", "FOOTER", "ASIDE", "TEXTAREA", "INPUT", "SELECT", "OPTION"].includes(tag)) return true;
+      if (el.closest("button, nav, header, footer, aside")) return true;
+      return false;
+    };
+    const nearestMessage = el => el.closest(messageSelector)
+      || el.closest("[class*='container-' i], [class*='wrapper' i], [class*='content' i]")
+      || el.parentElement;
+    const raw = [];
+    for (const img of Array.from(document.querySelectorAll(generatedImageSelector)).filter(visible)) {
+      const node = nearestMessage(img);
+      if (node) raw.push(node);
+    }
+    for (const node of Array.from(document.querySelectorAll(messageSelector)).filter(visible)) raw.push(node);
+    for (const node of Array.from(document.querySelectorAll("div, section, article, li")).filter(visible)) {
+      if (isUiChrome(node)) continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom > composerTop - 4) continue;
+      const text = textOf(node);
+      const hasGeneratedImage = Boolean(node.querySelector(generatedImageSelector));
+      if (hasGeneratedImage || (text.length >= 4 && text.length <= 1200 && rect.height <= window.innerHeight * 0.75)) raw.push(node);
+    }
+    const candidates = Array.from(new Set(raw))
+      .filter(node => visible(node) && !isUiChrome(node))
+      .map(node => {
+        const rect = rectOf(node);
+        const text = textOf(node);
+        const imgs = Array.from(node.querySelectorAll(generatedImageSelector))
+          .filter(visible)
+          .filter(img => img.naturalWidth >= 128 && img.naturalHeight >= 128)
+          .map(img => ({
+            url: img.currentSrc || img.src || "",
+            key: img.getAttribute("data-track-key") || "",
+            width: img.naturalWidth,
+            height: img.naturalHeight
+          }));
+        const idSource = [
+          node.getAttribute("data-message-id"),
+          node.getAttribute("data-messageid"),
+          node.id,
+          node.getAttribute("data-track-key"),
+          ...imgs.map(img => img.key)
+        ].filter(Boolean).join(" ");
+        const messageMatch = /(?:^|\\D)(\\d{8,})(?:\\D|$)/.exec(idSource);
+        return { text, imgs, rect, messageId: messageMatch ? messageMatch[1] : "", html: node.outerHTML.slice(0, 300) };
+      })
+      .filter(item => item.rect.bottom <= composerTop - 4 && (item.text || item.imgs.length))
+      .filter(item => item.rect.area <= window.innerWidth * window.innerHeight * 1.5)
+      .sort((a, b) => (b.rect.bottom - a.rect.bottom) || (b.rect.top - a.rect.top) || (a.rect.area - b.rect.area));
+    const last = candidates[0] || null;
+    if (!last) return { text: "", images: [], imageKeys: [], imageUrls: [], messageId: "", signature: "" };
+    const imageKeys = Array.from(new Set(last.imgs.map(img => img.key).filter(Boolean)));
+    const imageUrls = Array.from(new Set(last.imgs.map(img => img.url).filter(Boolean)));
+    const signature = [last.messageId, last.text, imageKeys.join("|"), imageUrls.join("|")].join("\\n").slice(0, 2000);
+    return {
+      text: last.text.slice(0, 1200),
+      images: last.imgs,
+      imageKeys,
+      imageUrls,
+      messageId: last.messageId,
+      signature,
+      rect: last.rect
+    };
+  })()`).catch(() => null);
+  const normalizedKeys = new Set();
+  for (const key of snapshot?.imageKeys || []) {
+    const normalized = normalizeImageKey(key);
+    if (normalized) normalizedKeys.add(normalized);
+  }
+  for (const url of snapshot?.imageUrls || []) {
+    const normalized = normalizeImageKey(url);
+    if (normalized) normalizedKeys.add(normalized);
+  }
+  return {
+    text: snapshot?.text || "",
+    images: Array.isArray(snapshot?.images) ? snapshot.images : [],
+    imageKeys: [...normalizedKeys],
+    imageUrls: Array.isArray(snapshot?.imageUrls) ? snapshot.imageUrls : [],
+    messageId: snapshot?.messageId || "",
+    signature: snapshot?.signature || "",
+    rect: snapshot?.rect || null,
+  };
+}
+
+function messageIdFromRecord(item) {
+  if (!item) return 0;
+  if (item.message_id && /^\d+$/.test(String(item.message_id))) return Number(item.message_id);
+  const key = item.key || imageKeyFromUrl(item.url);
+  const match = /^\d+_(\d+)_/.exec(String(key || ""));
+  return match ? Number(match[1]) : 0;
+}
+
+function classifyImageGenerationTextError(text) {
+  const value = String(text || "").trim();
+  if (/quota|limit|credits?|配额|额度|次数|今日.*用完|已用完|上限|限制|用尽/i.test(value)) return "IMAGE_GENERATION_QUOTA_EXHAUSTED";
+  if (/无法生成|不能生成|生成不了|拒绝|不支持|违规|安全|policy|cannot|can't|unable|refus/i.test(value)) return "IMAGE_GENERATION_REFUSED";
+  if (value) return "IMAGE_GENERATION_TEXT_RESPONSE";
+  return "IMAGE_GENERATION_NO_IMAGE";
+}
+
+function looksLikePromptEcho(text, promptText) {
+  const compact = value => String(value || "").replace(/\s+/g, " ").trim();
+  const reply = compact(text);
+  const prompt = compact(promptText);
+  if (!reply || !prompt) return false;
+  return reply === prompt || reply.includes(prompt.slice(0, 300)) || prompt.includes(reply.slice(0, 300));
+}
+
+function recordMatchesLastReply(item, lastReply) {
+  if (!lastReply) return true;
+  const replyKeys = new Set(lastReply.imageKeys || []);
+  const replyUrls = new Set(lastReply.imageUrls || []);
+  const itemKey = normalizeImageKey(item.key || item.url);
+  if (itemKey && replyKeys.has(itemKey)) return true;
+  if (item.url && replyUrls.has(item.url)) return true;
+  const itemMessageId = messageIdFromRecord(item);
+  if (lastReply.messageId && itemMessageId && String(itemMessageId) === String(lastReply.messageId)) return true;
+  return false;
+}
+
 function chooseDownloadItems(records, beforeUrls, options) {
-  const fresh = uniqueImageRecords(records).filter(item => !beforeUrls.has(item.url));
+  const fresh = uniqueImageRecords(records)
+    .filter(item => !beforeUrls.has(item.url))
+    .filter(item => recordMatchesLastReply(item, options.lastReply));
   const rawByKey = new Map();
   for (const item of fresh) {
-    const key = item.key || imageKeyFromUrl(item.url);
+    const key = normalizeImageKey(item.key || item.url);
     if (key && item.raw && !item.watermarked) rawByKey.set(key, item);
   }
   const resolved = fresh.map(item => {
-    const key = item.key || imageKeyFromUrl(item.url);
+    const key = normalizeImageKey(item.key || item.url);
     if (item.watermarked && key && rawByKey.has(key)) return rawByKey.get(key);
     return item;
   });
   const clean = resolved.filter(item => !item.watermarked);
+  const generated = clean.filter(item => item.key || /rc_gen_image/i.test(item.url));
   const preferred = clean.filter(item => item.raw);
   const fallbackAny = options.allowWatermark ? resolved : [];
-  const ordered = [...preferred, ...clean.filter(item => !item.raw), ...fallbackAny];
+  // Sort generated candidates by message id descending so the most recent image wins
+  const sortByRecent = items => [...items].sort((a, b) => messageIdFromRecord(b) - messageIdFromRecord(a));
+  const ordered = [
+    ...sortByRecent(generated.filter(item => item.raw)),
+    ...sortByRecent(generated.filter(item => !item.raw)),
+    ...sortByRecent(preferred.filter(item => !generated.includes(item))),
+    ...sortByRecent(clean.filter(item => !item.raw && !generated.includes(item))),
+    ...fallbackAny
+  ];
   return uniqueImageRecords(ordered).slice(0, options.count);
 }
 
@@ -758,10 +994,20 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
   const started = Date.now();
   let lastChange = Date.now();
   let lastCount = 0;
+  let lastReply = options.beforeLastReply || null;
+  let lastReplyChange = Date.now();
   while (Date.now() - started < options.timeout) {
     capturedRecords.push(...await collectHookImages(client));
     capturedRecords.push(...await collectDomImages(client));
-    const selected = chooseDownloadItems(capturedRecords, beforeUrls, options);
+    const reply = await lastReplySnapshot(client);
+    const replyChanged = reply.signature && reply.signature !== lastReply?.signature;
+    if (replyChanged) {
+      lastReply = reply;
+      lastReplyChange = Date.now();
+      console.log(`[dola-cli] last reply changed (text=${reply.text.length}, images=${reply.imageKeys.length}, messageId=${reply.messageId || "unknown"})`);
+    }
+    const scopedOptions = { ...options, lastReply };
+    const selected = chooseDownloadItems(capturedRecords, beforeUrls, scopedOptions);
     const freshRecords = uniqueImageRecords(capturedRecords).filter(item => !beforeUrls.has(item.url));
     const freshCount = freshRecords.length;
     if (freshCount !== lastCount) {
@@ -772,14 +1018,40 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
       const watermarked = freshRecords.filter(item => item.watermarked).length;
       console.log(`[dola-cli] captured ${freshCount} image URL(s), generated=${generated}, raw=${raw}, watermarked=${watermarked}, selected=${selected.length}`);
     }
-    if (selected.length >= options.count && Date.now() - lastChange >= options.stable) return selected;
+    const hasGenerated = selected.some(item => item.key || /rc_gen_image/i.test(item.url));
+    if (selected.length >= options.count && hasGenerated && Date.now() - lastChange >= options.stable) return selected;
+    const replyIsFinalText = lastReply?.signature
+      && lastReply.signature !== options.beforeLastReply?.signature
+      && !lastReply.imageKeys?.length
+      && lastReply.text
+      && Date.now() - lastReplyChange >= options.stable;
+    if (replyIsFinalText) {
+      const code = classifyImageGenerationTextError(lastReply.text);
+      if (!looksLikePromptEcho(lastReply.text, options.promptText)) {
+        throw new DolaCliError(code, `Image generation returned text instead of images: ${lastReply.text.slice(0, 300)}`, { lastReply });
+      }
+    }
     await sleep(1000);
   }
-  const selected = chooseDownloadItems(capturedRecords, beforeUrls, options);
-  if (selected.length) return selected;
-  throw new Error(options.allowWatermark
-    ? `Timed out after ${options.timeout}ms without generated image URLs.`
-    : `Timed out after ${options.timeout}ms without clean/raw image URLs. Use --allow-watermark to permit fallback URLs.`);
+  const finalReply = await lastReplySnapshot(client);
+  const scopedOptions = { ...options, lastReply: finalReply.signature ? finalReply : lastReply };
+  const selected = chooseDownloadItems(capturedRecords, beforeUrls, scopedOptions);
+  const hasGenerated = selected.some(item => item.key || /rc_gen_image/i.test(item.url));
+  if (selected.length && hasGenerated) return selected;
+  const reply = scopedOptions.lastReply;
+  if (reply?.signature && reply.signature !== options.beforeLastReply?.signature && !reply.imageKeys?.length && reply.text) {
+    const code = classifyImageGenerationTextError(reply.text);
+    if (!looksLikePromptEcho(reply.text, options.promptText)) {
+      throw new DolaCliError(code, `Image generation returned text instead of images: ${reply.text.slice(0, 300)}`, { lastReply: reply });
+    }
+  }
+  throw new DolaCliError(
+    options.allowWatermark ? "IMAGE_GENERATION_TIMEOUT" : "IMAGE_GENERATION_NO_CLEAN_IMAGE",
+    options.allowWatermark
+      ? `Timed out after ${options.timeout}ms without generated image URLs in the last reply.`
+      : `Timed out after ${options.timeout}ms without clean/raw image URLs in the last reply. Use --allow-watermark to permit fallback URLs.`,
+    { lastReply: reply || null }
+  );
 }
 
 function extensionFromUrl(url, contentType) {
@@ -998,9 +1270,13 @@ async function main() {
   if (!args.session) args.session = await askRequired(`Dola chat session URL or id (required, example ${DEFAULT_SESSION}): `);
 
   const sessionUrl = normalizeSession(args.session);
-  const promptText = args.dryRun || args.debugUi || args.debugImages ? "" : await loadPrompt(args);
+  const promptTexts = args.dryRun || args.debugUi || args.debugImages
+    ? []
+    : args.batchPromptFile
+      ? await loadBatchPrompts(args.batchPromptFile)
+      : [await loadPrompt(args)];
   const files = args.dryRun || args.debugUi || args.debugImages ? [] : await normalizeFiles(args.files);
-  if (!args.dryRun && !args.debugUi && !args.debugImages && !promptText) throw new Error("prompt is required.");
+  if (!args.dryRun && !args.debugUi && !args.debugImages && !promptTexts.length) throw new Error("prompt is required.");
 
   console.log(`[dola-cli] connecting CDP ${args.cdp}`);
   const target = await findOrCreateTarget(args.cdp, sessionUrl, args.newChat);
@@ -1040,43 +1316,71 @@ async function main() {
     return;
   }
 
-  await clearImageHook(client);
   const attached = await attachFiles(client, files);
-  const beforeImageUrls = new Set([
-    ...(await collectHookImages(client)).map(item => item.url),
-    ...(await collectDomImages(client)).map(item => item.url),
-  ]);
+  if (attached.length) {
+    await sleep(2000);
+  }
   const capturedRecords = [];
   installNetworkImageCapture(client, capturedRecords);
 
-  const submit = await submitPrompt(client, promptText, args);
-  console.log(`[dola-cli] submitted via ${submit.method} (${submit.selector})`);
-  const finalUrl = args.newChat || isChatHomeUrl(sessionUrl)
-    ? await waitForConcreteChatUrl(client, currentUrl)
-    : await evaluate(client, "location.href").catch(() => currentUrl);
+  const results = [];
+  for (const [index, promptText] of promptTexts.entries()) {
+    await clearImageHook(client);
+    const beforeResponse = await pageSnapshot(client);
+    const beforeImageUrls = new Set([
+      ...(await collectHookImages(client)).map(item => item.url),
+      ...(await collectDomImages(client)).map(item => item.url),
+    ]);
+    const beforeLastReply = args.imageGen ? await lastReplySnapshot(client) : null;
 
-  const finalSnapshot = args.noWait || (args.imageGen && !args.noDownload)
-    ? await pageSnapshot(client)
-    : await waitForResponseText(client, before.textTail || "", args);
-  const downloaded = args.imageGen && !args.noWait && !args.noDownload
-    ? await downloadImages(await waitForDownloadItems(client, beforeImageUrls, capturedRecords, args), path.resolve(args.out), args)
-    : [];
+    if (args.batchPromptFile) console.log(`[dola-cli] batch prompt ${index + 1}/${promptTexts.length}`);
+    const submit = await submitPrompt(client, promptText, args);
+    console.log(`[dola-cli] submitted via ${submit.method} (${submit.selector})`);
+    const finalUrl = args.newChat || isChatHomeUrl(sessionUrl)
+      ? await waitForConcreteChatUrl(client, currentUrl)
+      : await evaluate(client, "location.href").catch(() => currentUrl);
 
-  console.log(JSON.stringify({
-    sessionUrl,
-    finalUrl,
-    prompt: promptText,
-    attached,
-    submitted: true,
-    submit,
-    imageGeneration: Boolean(args.imageGen),
-    downloaded,
-    page: finalSnapshot,
-  }, null, 2));
+    const finalSnapshot = args.noWait || (args.imageGen && !args.noDownload)
+      ? await pageSnapshot(client)
+      : await waitForResponseText(client, beforeResponse.textTail || "", args);
+    const downloaded = args.imageGen && !args.noWait && !args.noDownload
+      ? await downloadImages(await waitForDownloadItems(client, beforeImageUrls, capturedRecords, { ...args, beforeLastReply, promptText }), path.resolve(args.out), args)
+      : [];
+
+    results.push({
+      index: index + 1,
+      finalUrl,
+      prompt: promptText,
+      submit,
+      downloaded,
+      page: finalSnapshot,
+    });
+    currentUrl = finalUrl;
+  }
+
+  const output = args.batchPromptFile
+    ? {
+      sessionUrl,
+      attached,
+      imageGeneration: true,
+      batchPromptFile: path.resolve(args.batchPromptFile),
+      submitted: results.length,
+      results,
+    }
+    : {
+      sessionUrl,
+      attached,
+      submitted: true,
+      imageGeneration: Boolean(args.imageGen),
+      ...results[0],
+    };
+  console.log(JSON.stringify(output, null, 2));
   client.close();
 }
 
 main().catch(error => {
-  console.error(`[dola-cli] failed: ${error.stack || error.message}`);
+  const code = error.code || "DOLA_CLI_ERROR";
+  const details = error.details ? `\n${JSON.stringify(error.details, null, 2)}` : "";
+  console.error(`[dola-cli] failed (${code}): ${error.stack || error.message}${details}`);
   process.exit(1);
 });
