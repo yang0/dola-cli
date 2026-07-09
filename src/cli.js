@@ -42,13 +42,23 @@ Demos:
   bun src/cli.js --session "${DEFAULT_SESSION}" --dry-run
   bun src/cli.js --session "${DEFAULT_SESSION}" --file "E:\\temp\\aa.png" --prompt "请描述这张图片" --no-wait
   bun src/cli.js --new-chat --file "E:\\temp\\aa.png" --prompt "What is in this image?"
+  bun src/cli.js --new-chat --character-image "E:\\temp\\avatar.png" \\
+    --character-prompt "这是主角的形象，请记住" --batch-prompt-file prompts.txt \\
+    --character-batch-size 10 --out downloads
+  bun src/cli.js --resume --new-chat --character-image "E:\\temp\\avatar.png" \\
+    --character-prompt "这是主角的形象，请记住" --batch-prompt-file prompts.txt \\
+    --out downloads
+  bun src/cli.js --account-pool "G:\\cookies\\dola" --resume --new-chat \\
+    --character-image "E:\\temp\\avatar.png" \\
+    --character-prompt "这是主角的形象，请记住" --batch-prompt-file prompts.txt \\
+    --out downloads
 
 Options:
   --session <url|id>       Existing Dola chat URL/id, or ${DOLA_CHAT_HOME}.
   --new-chat               Start at ${DOLA_CHAT_HOME}.
   --resume                 Resume a batch from saved state/output files.
   --session-state <path>   Session/state file. Default: ${DEFAULT_SESSION_STATE}
-  --account-pool <path>    JSON file of logged-in account/CDP entries to rotate.
+  --account-pool <path>    Cookie directory or JSON account/CDP pool to rotate.
   --prompt <text>          Prompt to submit. If omitted, the CLI asks interactively.
   --prompt-file <path>     Read prompt from a UTF-8 text file.
   --batch-prompt-file <path>
