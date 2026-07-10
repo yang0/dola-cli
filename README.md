@@ -58,6 +58,19 @@ bun src\cli.js --new-chat `
   --out downloads
 ```
 
+To test or resume an exact original line range, use `--from-line` and
+`--to-line`. The saved filename keeps the original prompt-file line number,
+even when earlier lines are skipped:
+
+```powershell
+bun src\cli.js --new-chat `
+  --from-line 25 --to-line 25 `
+  --character-image "E:\temp\avatar.png" `
+  --character-prompt "这是主角的形象，请记住" `
+  --batch-prompt-file prompts.txt `
+  --out downloads
+```
+
 The character image and character prompt are sent once before each group of
 prompts, including the first group. Fixed-character mode generates exactly one
 image per non-empty prompt and keeps the original text-file line number in the
@@ -116,6 +129,12 @@ the CLI also recognizes existing files named `行号,短哈希.扩展名` in the
 directory and skips those lines. When the previous session is stuck, combine
 `--resume --new-chat`; completed lines remain skipped, while the new session
 uploads the character image again before continuing.
+
+Before submitting a prompt, the state file records the in-flight line and the
+previous reply image keys. After an interruption, `--resume` first tries to
+recover that exact reply and download its images; it opens a fresh image session
+only when no matching image can be recovered. This prevents a delayed download
+from causing the same prompt to be submitted twice.
 
 Image downloads prefer raw/original/no-watermark URLs. In fixed-character batch
 mode, a watermarked URL is used only when no raw URL is available. In ordinary

@@ -63,6 +63,8 @@ Options:
   --prompt-file <path>     Read prompt from a UTF-8 text file.
   --batch-prompt-file <path>
                            Generate images for each non-empty line in a UTF-8 text file.
+  --from-line <n>         Start at this original prompt file line number.
+  --to-line <n>           Stop at this original prompt file line number.
   --character-image <path> Fixed character reference image for batch generation.
   --character-prompt <text>
                            Prompt describing the fixed character reference image.
@@ -116,6 +118,8 @@ function parseArgs(argv) {
     else if (arg === "--prompt") args.prompt = value();
     else if (arg === "--prompt-file") args.promptFile = value();
     else if (arg === "--batch-prompt-file") args.batchPromptFile = value();
+    else if (arg === "--from-line") args.fromLine = Number(value());
+    else if (arg === "--to-line") args.toLine = Number(value());
     else if (arg === "--character-image") args.characterImage = value();
     else if (arg === "--character-prompt") args.characterPrompt = value();
     else if (arg === "--character-batch-size") args.characterBatchSize = Number(value());
@@ -140,6 +144,15 @@ function parseArgs(argv) {
   if (!Number.isInteger(args.maxRetries) || args.maxRetries < 0) throw new Error("--max-retries must be a non-negative integer.");
   if (args.characterBatchSize !== undefined && (!Number.isInteger(args.characterBatchSize) || args.characterBatchSize < 1)) {
     throw new Error("--character-batch-size must be a positive integer.");
+  }
+  if (args.fromLine !== undefined && (!Number.isInteger(args.fromLine) || args.fromLine < 1)) {
+    throw new Error("--from-line must be a positive integer.");
+  }
+  if (args.toLine !== undefined && (!Number.isInteger(args.toLine) || args.toLine < 1)) {
+    throw new Error("--to-line must be a positive integer.");
+  }
+  if (args.fromLine !== undefined && args.toLine !== undefined && args.fromLine > args.toLine) {
+    throw new Error("--from-line cannot be greater than --to-line.");
   }
   const hasCharacterOption = Boolean(args.characterImage || args.characterPrompt || args.characterBatchSize !== undefined);
   if (hasCharacterOption) {
@@ -600,6 +613,26 @@ async function waitForConcreteChatUrl(client, initialUrl, timeoutMs = 60000) {
     await sleep(1000);
   }
   return lastUrl;
+}
+
+async function waitForComposer(client, timeoutMs = 30000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const ready = await evaluate(client, `(() => {
+      const visible = el => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      };
+      return Boolean(
+        Array.from(document.querySelectorAll("textarea, [contenteditable='true'], [role='textbox']")).some(visible)
+        || document.querySelector("input[type=file]")
+      );
+    })()`).catch(() => false);
+    if (ready) return;
+    await sleep(1000);
+  }
+  throw new Error(`Dola composer/file input did not appear within ${timeoutMs}ms.`);
 }
 
 async function ensureImageGenerationMode(client) {
@@ -1174,6 +1207,17 @@ function recordMatchesLastReply(item, lastReply) {
   return false;
 }
 
+function recordsFromLastReply(lastReply) {
+  if (!lastReply) return [];
+  return (lastReply.imageUrls || []).map((url, index) => ({
+    url,
+    key: lastReply.imageKeys?.[index] || imageKeyFromUrl(url),
+    message_id: lastReply.messageId || "",
+    raw: isPreferredRawUrl(url),
+    watermarked: isWatermarkedUrl(url),
+  }));
+}
+
 function chooseDownloadItems(records, beforeUrls, options) {
   const fresh = uniqueImageRecords(records)
     .filter(item => !beforeUrls.has(item.url))
@@ -1206,6 +1250,27 @@ function chooseDownloadItems(records, beforeUrls, options) {
     ...fallbackAny
   ];
   return uniqueImageRecords(ordered).slice(0, options.count);
+}
+
+async function recoverPendingDownload(client, capturedRecords, inFlight, options) {
+  const beforeUrls = new Set(inFlight?.beforeUrls || []);
+  const beforeImageKeys = new Set(inFlight?.beforeImageKeys || []);
+  const started = Date.now();
+  let lastReply = null;
+  while (Date.now() - started < Math.min(options.timeout, 120000)) {
+    lastReply = await lastReplySnapshot(client);
+    capturedRecords.push(...recordsFromLastReply(lastReply));
+    capturedRecords.push(...await collectHookImages(client));
+    capturedRecords.push(...await collectDomImages(client));
+    const selected = chooseDownloadItems(capturedRecords, beforeUrls, {
+      ...options,
+      beforeImageKeys,
+      lastReply,
+    });
+    if (selected.length >= options.count && selected.some(item => item.key || /rc_gen_image/i.test(item.url))) return selected;
+    await sleep(1000);
+  }
+  return null;
 }
 
 async function imageGenerationUiSnapshot(client) {
@@ -1307,6 +1372,7 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
         console.log(`[dola-cli] anchored last reply images=${lastReply.imageKeys.length} messageId=${lastReply.messageId || "unknown"}`);
       }
     }
+    capturedRecords.push(...recordsFromLastReply(lastReply));
     capturedRecords.push(...await collectHookImages(client));
     capturedRecords.push(...await collectDomImages(client));
     const scopedOptions = { ...options, lastReply };
@@ -1339,6 +1405,7 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
     await sleep(1000);
   }
   const finalReply = await lastReplySnapshot(client);
+  capturedRecords.push(...recordsFromLastReply(finalReply));
   const scopedOptions = { ...options, lastReply: finalReply.signature ? finalReply : lastReply };
   const selected = chooseDownloadItems(capturedRecords, beforeUrls, scopedOptions);
   const hasGenerated = selected.some(item => item.key || /rc_gen_image/i.test(item.url));
@@ -1601,6 +1668,7 @@ async function waitForResponseText(client, beforeTail, options) {
 
 async function sendCharacterContext(client, imagePath, characterPrompt, options) {
   const beforeGenerationUi = await imageGenerationUiSnapshot(client);
+  await waitForComposer(client);
   await clearImageHook(client);
   await attachFiles(client, [imagePath]);
   await submitPrompt(client, characterPrompt, options);
@@ -1648,29 +1716,40 @@ async function main() {
   let accountPool = accountPoolFile ? await loadAccountPool(accountPoolFile) : [];
   const accountDay = accountDayKey();
   const restrictedAccounts = restrictedAccountSet(savedState, accountDay);
+  const pendingRecoverySession = args.resume && savedState?.inFlight?.sessionUrl
+    ? savedState.inFlight.sessionUrl
+    : "";
   let activeAccount = accountPool.length
     ? chooseAccount(accountPool, restrictedAccounts, savedState?.accountId || "")
     : null;
   if (activeAccount) {
     args.cdp = activeAccount.cdp;
-    args.session = args.newChat ? DOLA_IMAGE_HOME : (activeAccount.session || args.session || savedState?.lastSessionUrl);
+    args.session = pendingRecoverySession
+      || (args.newChat ? DOLA_IMAGE_HOME : (activeAccount.session || args.session || savedState?.lastSessionUrl));
   }
   if (!args.session && !args.newChat && savedState?.lastSessionUrl) {
     args.session = savedState.lastSessionUrl;
     console.log(`[dola-cli] resuming remembered session ${args.session}`);
   }
-  if (args.newChat) args.session = args.imageGen ? DOLA_IMAGE_HOME : DOLA_CHAT_HOME;
+  if (args.newChat && !pendingRecoverySession) args.session = args.imageGen ? DOLA_IMAGE_HOME : DOLA_CHAT_HOME;
   if (activeAccount && !args.newChat && !args.session) {
     throw new Error(`Account ${activeAccount.id} needs a session URL, or use --new-chat.`);
   }
   if (!args.session) args.session = await askRequired(`Dola chat session URL or id (required, example ${DEFAULT_SESSION}): `);
 
   let sessionUrl = normalizeSession(args.session);
-  const promptEntries = args.dryRun || args.debugUi || args.debugImages
+  const allPromptEntries = args.dryRun || args.debugUi || args.debugImages
     ? []
     : args.batchPromptFile
       ? await loadBatchPrompts(args.batchPromptFile)
       : [{ text: await loadPrompt(args), line: null }];
+  const promptEntries = allPromptEntries.filter(item => {
+    const line = typeof item === "string" ? null : item.line;
+    if (line === null) return true;
+    if (args.fromLine !== undefined && line < args.fromLine) return false;
+    if (args.toLine !== undefined && line > args.toLine) return false;
+    return true;
+  });
   const files = args.dryRun || args.debugUi || args.debugImages ? [] : await normalizeFiles(args.files);
   const characterImage = args.dryRun || args.debugUi || args.debugImages
     ? []
@@ -1719,6 +1798,7 @@ async function main() {
     return;
   }
 
+  if (files.length) await waitForComposer(client);
   const attached = await attachFiles(client, files);
   if (attached.length) {
     await sleep(2000);
@@ -1768,6 +1848,57 @@ async function main() {
       results.push({ index: index + 1, line: lineNumber, prompt: promptText, skipped: true, downloaded: [{ ...completed }] });
       continue;
     }
+    if (args.resume && savedState?.inFlight?.line === lineNumber && !completed) {
+      console.log(`[dola-cli] recovering interrupted line ${lineNumber} before submitting again`);
+      const recoveredItems = await recoverPendingDownload(client, capturedRecords, savedState.inFlight, {
+        ...args,
+        count: 1,
+        promptText,
+        watermarkFallback: Boolean(args.characterImage),
+      });
+      if (recoveredItems) {
+        const recoveredDownloaded = await downloadImages(recoveredItems, path.resolve(args.out), {
+          ...args,
+          lineNumber,
+          hashNaming: Boolean(args.characterImage),
+          watermarkFallback: Boolean(args.characterImage),
+          seenHashes,
+        });
+        for (const item of recoveredDownloaded) {
+          completedByLine.set(Number(lineNumber), {
+            line: lineNumber,
+            hash: item.hash,
+            shortHash: item.shortHash,
+            file: item.file,
+            prompt: promptText,
+          });
+        }
+        await writeJsonFile(sessionStateFile, {
+          ...(savedState || {}),
+          ...poolState(),
+          version: 1,
+          lastSessionUrl: currentUrl,
+          batchPromptFile: path.resolve(args.batchPromptFile),
+          characterImage: args.characterImage ? path.resolve(args.characterImage) : "",
+          characterPrompt: args.characterPrompt || "",
+          characterBatchSize: args.characterBatchSize || null,
+          completed: [...completedByLine.values()].filter(item => item.line && item.file),
+          inFlight: null,
+          updatedAt: new Date().toISOString(),
+        });
+        results.push({ index: index + 1, line: lineNumber, prompt: promptText, recovered: true, downloaded: recoveredDownloaded });
+        continue;
+      }
+      console.log(`[dola-cli] no recoverable image for interrupted line ${lineNumber}; opening a fresh image session`);
+      await client.send("Page.navigate", { url: DOLA_IMAGE_HOME });
+      await waitForPageReady(client);
+      await sleep(3000);
+      currentUrl = await evaluate(client, "location.href").catch(() => DOLA_IMAGE_HOME);
+      await installImageHook(client);
+      capturedRecords.length = 0;
+      installNetworkImageCapture(client, capturedRecords);
+      forceCharacterContext = Boolean(args.characterImage);
+    }
     let attempt = 0;
     while (true) {
       try {
@@ -1794,6 +1925,23 @@ async function main() {
       const beforeGenerationUi = args.imageGen ? await imageGenerationUiSnapshot(client) : null;
       capturedRecords.length = 0;
 
+      await writeJsonFile(sessionStateFile, {
+        ...(savedState || {}),
+        ...poolState(),
+        version: 1,
+        lastSessionUrl: currentUrl,
+        completed: [...completedByLine.values()].filter(item => item.line && item.file),
+        inFlight: {
+          line: lineNumber,
+          prompt: promptText,
+          sessionUrl: currentUrl,
+          accountId: activeAccount?.id || "",
+          beforeUrls: [...beforeImageUrls],
+          beforeImageKeys: [...beforeImageKeys],
+        },
+        updatedAt: new Date().toISOString(),
+      });
+
       if (args.batchPromptFile) console.log(`[dola-cli] batch prompt ${lineNumber ?? index + 1}/${promptEntries.length}`);
       const submit = await submitPrompt(client, promptText, args);
       console.log(`[dola-cli] submitted via ${submit.method} (${submit.selector})`);
@@ -1806,6 +1954,14 @@ async function main() {
         version: 1,
         lastSessionUrl: finalUrl,
         completed: [...completedByLine.values()].filter(item => item.line && item.file),
+        inFlight: {
+          line: lineNumber,
+          prompt: promptText,
+          sessionUrl: finalUrl,
+          accountId: activeAccount?.id || "",
+          beforeUrls: [...beforeImageUrls],
+          beforeImageKeys: [...beforeImageKeys],
+        },
         updatedAt: new Date().toISOString(),
       });
 
@@ -1871,11 +2027,12 @@ async function main() {
           characterBatchSize: args.characterBatchSize || null,
           completed: [...completedForState.values()]
             .filter(item => item.line && item.file),
+          inFlight: null,
           updatedAt: new Date().toISOString(),
         };
         await writeJsonFile(sessionStateFile, state);
       } else {
-        await writeJsonFile(sessionStateFile, { ...poolState(), version: 1, lastSessionUrl: finalUrl, updatedAt: new Date().toISOString() });
+        await writeJsonFile(sessionStateFile, { ...poolState(), version: 1, lastSessionUrl: finalUrl, inFlight: null, updatedAt: new Date().toISOString() });
       }
       currentUrl = finalUrl;
       break;
