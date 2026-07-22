@@ -29,10 +29,10 @@ Submit a message, optionally with local image/file attachments, to Dola chat
 through an existing Chrome session exposed on CDP port 9221.
 
 Usage:
-  bun src/cli.js --session <dola-chat-url|id> --prompt <text> [options]
-  bun src/cli.js --new-chat --prompt <text> [options]
-  bun src/cli.js --new-chat --batch-prompt-file <path> [options]
-  bun src/cli.js --new-chat --video-gen --prompt <text> [options]
+  dola --session <dola-chat-url|id> --prompt <text> [options]
+  dola --new-chat --prompt <text> [options]
+  dola --new-chat --batch-prompt-file <path> [options]
+  dola --video-gen --prompt <text> [options]
 
 Prerequisites:
   1. Start Chrome with --remote-debugging-port=9221.
@@ -40,18 +40,18 @@ Prerequisites:
   3. Omit --session to reuse an open Dola chat or create one, or provide --session to use a specific chat.
 
 Demos:
-  bun src/cli.js --session "${DEFAULT_SESSION}" --dry-run
-  bun src/cli.js --session "${DEFAULT_SESSION}" --file "E:\\temp\\aa.png" --prompt "请描述这张图片" --no-wait
-  bun src/cli.js --new-chat --file "E:\\temp\\aa.png" --prompt "What is in this image?"
-  bun src/cli.js --new-chat --character-image "E:\\temp\\avatar.png" \\
-    --character-prompt "这是主角的形象，请记住" --batch-prompt-file prompts.txt \\
+  dola --session "${DEFAULT_SESSION}" --dry-run
+  dola --session "${DEFAULT_SESSION}" --file "E:\\temp\\aa.png" --prompt "璇锋弿杩拌繖寮犲浘鐗? --no-wait
+  dola --file "E:\\temp\\aa.png" --prompt "What is in this image?"
+  dola --character-image "E:\\temp\\avatar.png" \\
+    --character-prompt "杩欐槸涓昏鐨勫舰璞★紝璇疯浣? --batch-prompt-file prompts.txt \\
     --character-batch-size 10 --out downloads
-  bun src/cli.js --resume --new-chat --character-image "E:\\temp\\avatar.png" \\
-    --character-prompt "这是主角的形象，请记住" --batch-prompt-file prompts.txt \\
+  dola --resume --new-chat --character-image "E:\\temp\\avatar.png" \\
+    --character-prompt "杩欐槸涓昏鐨勫舰璞★紝璇疯浣? --batch-prompt-file prompts.txt \\
     --out downloads
-  bun src/cli.js --account-pool "G:\\cookies\\dola" --resume --new-chat \\
+  dola --account-pool "G:\\cookies\\dola" --resume --new-chat \\
     --character-image "E:\\temp\\avatar.png" \\
-    --character-prompt "这是主角的形象，请记住" --batch-prompt-file prompts.txt \\
+    --character-prompt "杩欐槸涓昏鐨勫舰璞★紝璇疯浣? --batch-prompt-file prompts.txt \\
     --out downloads
 
 Options:
@@ -765,8 +765,8 @@ async function ensureImageGenerationMode(client) {
 
 async function ensureVideoGenerationMode(client) {
   const state = await evaluate(client, `(() => {
-    const videoTexts = ["视频生成", "生成视频", "Create Video", "Video Generation", "Text to Video", "Image to Video"];
-    const videoRegex = /video|视频/i;
+    const videoTexts = ["瑙嗛鐢熸垚", "鐢熸垚瑙嗛", "Create Video", "Video Generation", "Text to Video", "Image to Video"];
+    const videoRegex = /video|瑙嗛/i;
     const visible = el => {
       const rect = el.getBoundingClientRect();
       const style = getComputedStyle(el);
@@ -898,7 +898,7 @@ async function clickAttachmentButton(client) {
       const style = getComputedStyle(el);
       return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
     };
-    const words = /attach|upload|image|file|photo|添加|上传|图片|文件|附件|照片/i;
+    const words = /attach|upload|image|file|photo|娣诲姞|涓婁紶|鍥剧墖|鏂囦欢|闄勪欢|鐓х墖/i;
     const candidates = Array.from(document.querySelectorAll("button, [role='button'], label, [aria-label], [title]"))
       .filter(visible)
       .map(el => ({ el, text: [el.innerText, el.textContent, el.getAttribute("aria-label"), el.title, el.className, el.id].join(" "), rect: el.getBoundingClientRect() }))
@@ -923,7 +923,7 @@ async function waitForAttachments(client, names) {
       return {
         selected,
         seen: names.filter(name => body.includes(name)),
-        uploading: /uploading|processing|上传中|处理中/i.test(body),
+        uploading: /uploading|processing|涓婁紶涓瓅澶勭悊涓?i.test(body),
       };
     })()`).catch(() => null);
     if (state?.seen?.length === names.length && !state.uploading) return;
@@ -1038,7 +1038,7 @@ async function findSendButton(client) {
           y: rect.y + rect.height / 2
         };
       }
-      const words = /send|submit|generate|发送|提交|生成/i;
+      const words = /send|submit|generate|鍙戦€亅鎻愪氦|鐢熸垚/i;
       const candidates = Array.from(document.querySelectorAll("button, [role='button'], [aria-label], [title]"))
         .filter(visible)
         .map(el => ({ el, text: [el.innerText, el.textContent, el.getAttribute("aria-label"), el.title, el.className, el.id].join(" ").trim(), rect: el.getBoundingClientRect(), disabled: el.disabled || el.getAttribute("aria-disabled") }))
@@ -1230,7 +1230,7 @@ async function openLatestVideoMoreMenu(client) {
     const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden"; };
     const candidates = Array.from(document.querySelectorAll("button, [role='button'], div, [aria-label], [title]"))
       .filter(visible)
-      .filter(el => (el.innerText || el.textContent || el.getAttribute("aria-label") || el.title || "").includes("更多"))
+      .filter(el => (el.innerText || el.textContent || el.getAttribute("aria-label") || el.title || "").includes("鏇村"))
       .sort((a, b) => (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height));
     const el = candidates[0];
     if (!el) return null;
@@ -1376,14 +1376,14 @@ function messageIdFromRecord(item) {
 
 function classifyImageGenerationTextError(text) {
   const value = String(text || "").trim();
-  // Generation progress text (which often echoes the prompt containing words like "限制")
+  // Generation progress text (which often echoes the prompt containing words like "闄愬埗")
   // should not be misclassified as a quota or refusal error.
   if (looksLikeImageGenerationProgress(value)) return "IMAGE_GENERATION_TEXT_RESPONSE";
-  if (/账号受限|账户受限|账号封禁|账户封禁|account.*(?:restricted|suspended|disabled)|too many requests|rate limit/i.test(value)) {
+  if (/璐﹀彿鍙楅檺|璐︽埛鍙楅檺|璐﹀彿灏佺|璐︽埛灏佺|account.*(?:restricted|suspended|disabled)|too many requests|rate limit/i.test(value)) {
     return "ACCOUNT_RESTRICTED";
   }
-  if (/quota|limit|credits?|配额|额度|次数|今日.*用完|已用完|上限|限制|用尽/i.test(value)) return "IMAGE_GENERATION_QUOTA_EXHAUSTED";
-  if (/无法生成|不能生成|生成不了|拒绝|不支持|违规|安全|policy|cannot|can't|unable|refus/i.test(value)) return "IMAGE_GENERATION_REFUSED";
+  if (/quota|limit|credits?|閰嶉|棰濆害|娆℃暟|浠婃棩.*鐢ㄥ畬|宸茬敤瀹寍涓婇檺|闄愬埗|鐢ㄥ敖/i.test(value)) return "IMAGE_GENERATION_QUOTA_EXHAUSTED";
+  if (/鏃犳硶鐢熸垚|涓嶈兘鐢熸垚|鐢熸垚涓嶄簡|鎷掔粷|涓嶆敮鎸亅杩濊|瀹夊叏|policy|cannot|can't|unable|refus/i.test(value)) return "IMAGE_GENERATION_REFUSED";
   if (value) return "IMAGE_GENERATION_TEXT_RESPONSE";
   return "IMAGE_GENERATION_NO_IMAGE";
 }
@@ -1394,8 +1394,8 @@ function isAccountRestrictedError(error) {
 
 function looksLikeImageGenerationProgress(text) {
   const value = String(text || "");
-  return /generate(?:d|ing)?\s+image|will\s+generate|starting\s+to\s+generate|generating|正在生成|生成中|开始生成|即将生成|请稍候|请稍等|稍等/i.test(value)
-    || /正在.*生成|生成.*图片|生成.*场景|正在为您|视频生成.*(?:需要|大约)|(?:视频|video).*(?:1\s*[-–~到]\s*[35]\s*(?:分钟|minutes?)|生成好|完成后).*(?:发送|send)/i.test(value);
+  return /generate(?:d|ing)?\s+image|will\s+generate|starting\s+to\s+generate|generating|姝ｅ湪鐢熸垚|鐢熸垚涓瓅寮€濮嬬敓鎴恷鍗冲皢鐢熸垚|璇风◢鍊檤璇风◢绛墊绋嶇瓑/i.test(value)
+    || /姝ｅ湪.*鐢熸垚|鐢熸垚.*鍥剧墖|鐢熸垚.*鍦烘櫙|姝ｅ湪涓烘偍|瑙嗛鐢熸垚.*(?:闇€瑕亅澶х害)|(?:瑙嗛|video).*(?:1\s*[-鈥搤鍒癩\s*[35]\s*(?:鍒嗛挓|minutes?)|鐢熸垚濂絴瀹屾垚鍚?.*(?:鍙戦€亅send)/i.test(value);
 }
 
 function looksLikePromptEcho(text, promptText) {
@@ -1934,7 +1934,7 @@ async function imageDebugSnapshot(client) {
           rect: rectOf(el),
           ancestry: ancestry(el),
         }))
-        .filter(item => item.src && (/video|mp4|webm|mov|download|下载/i.test(item.src + " " + item.text)))
+        .filter(item => item.src && (/video|mp4|webm|mov|download|涓嬭浇/i.test(item.src + " " + item.text)))
         .slice(0, 80),
       videoActions: Array.from(document.querySelectorAll('[class*="block-video"], [class*="video-hover"]'))
         .filter(visible)
@@ -2240,9 +2240,9 @@ async function main() {
         continue;
       }
       const recoveryAnswer = await askRequired(
-        `[dola-cli] 中断的第 ${lineNumber} 条在原会话中没有确认到图片。请检查 Dola 页面；确认确实没有图片请输入 yes，页面有图片请输入 no: `
+        `[dola-cli] 涓柇鐨勭 ${lineNumber} 鏉″湪鍘熶細璇濅腑娌℃湁纭鍒板浘鐗囥€傝妫€鏌?Dola 椤甸潰锛涚‘璁ょ‘瀹炴病鏈夊浘鐗囪杈撳叆 yes锛岄〉闈㈡湁鍥剧墖璇疯緭鍏?no: `
       );
-      if (!/^(y|yes|是|没有|无图|确认)$/i.test(recoveryAnswer.trim())) {
+      if (!/^(y|yes|鏄瘄娌℃湁|鏃犲浘|纭)$/i.test(recoveryAnswer.trim())) {
         throw new DolaCliError("IMAGE_GENERATION_UNCONFIRMED", `Could not confirm an image for interrupted line ${lineNumber}.`, {
           failedLine: lineNumber,
           userConfirmedPageHasImage: true,
@@ -2403,9 +2403,9 @@ async function main() {
         const missingImage = ["IMAGE_GENERATION_TIMEOUT", "IMAGE_GENERATION_NO_CLEAN_IMAGE"].includes(error.code);
         if (missingImage && args.batchPromptFile) {
           const answer = await askRequired(
-            `[dola-cli] 第 ${lineNumber} 条已提交，但程序没有确认最后回复中的图片。请检查 Dola 页面；确认页面确实没有图片请输入 yes，页面有图片请输入 no: `
+            `[dola-cli] 绗?${lineNumber} 鏉″凡鎻愪氦锛屼絾绋嬪簭娌℃湁纭鏈€鍚庡洖澶嶄腑鐨勫浘鐗囥€傝妫€鏌?Dola 椤甸潰锛涚‘璁ら〉闈㈢‘瀹炴病鏈夊浘鐗囪杈撳叆 yes锛岄〉闈㈡湁鍥剧墖璇疯緭鍏?no: `
           );
-          if (!/^(y|yes|是|没有|无图|确认)$/i.test(answer.trim())) {
+          if (!/^(y|yes|鏄瘄娌℃湁|鏃犲浘|纭)$/i.test(answer.trim())) {
             error.details = {
               ...(error.details || {}),
               failedLine: lineNumber,
