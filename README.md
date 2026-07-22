@@ -3,16 +3,16 @@
 Small Bun CLI for driving Dola through an existing Chrome CDP session.
 
 It follows the same browser-control approach as `E:\projectHome\doubao-img`:
-connect to Chrome on port `9222`, open or reuse a Dola chat session, attach local
+connect to Chrome on port `9221`, open or reuse a Dola chat session, attach local
 files, submit prompts, create new sessions, switch to image generation, and
 download generated images.
 
 ## Prerequisites
 
-Start Chrome with remote debugging enabled and log in to Dola manually:
+Start Chrome with remote debugging enabled on port 9221 and log in to Dola manually:
 
 ```powershell
-chrome.exe --remote-debugging-port=9222
+chrome.exe --remote-debugging-port=9221
 ```
 
 ## Chat
@@ -28,6 +28,33 @@ bun src\cli.js --new-chat --prompt "Hello" --no-wait
 ```
 
 The JSON output includes `finalUrl`, for example `https://www.dola.com/chat/<id>`.
+
+## Video Generation
+
+Generate a video with optional duration, aspect ratio, and zero or more local
+reference images. Repeat `--file`/`--attach` for multiple references:
+
+```powershell
+bun src\cli.js --new-chat --video-gen `
+  --duration 5 --aspect-ratio 16:9 `
+  --file "E:\temp\first.png" --file "E:\temp\second.png" `
+  --prompt "A paper boat sailing through a rainy neon city" `
+  --out downloads
+```
+
+Reference images are optional. `--duration` accepts 1–60 seconds; Dola's
+available duration choices may further restrict that value. `--aspect-ratio`
+accepts values such as `16:9`, `9:16`, and `1:1`. Use `--no-download` to wait
+for generation without saving the returned video.
+
+Video generation stays in the current chat form: the CLI selects Video, then
+the duration and ratio controls without navigating away. It polls the current
+reply once a minute for up to six minutes. To download the newest completed
+video later without submitting another prompt, run:
+
+```powershell
+bun src\cli.js --session "https://www.dola.com/chat/<id>" --download-last-video --out downloads
+```
 
 ## Image Generation
 
@@ -110,7 +137,7 @@ For separate Chrome/CDP endpoints, use JSON instead:
 ```json
 {
   "accounts": [
-    { "id": "account-1", "cdp": "http://127.0.0.1:9222", "cookieFile": "G:\\cookies\\dola\\dola_1.txt" },
+    { "id": "account-1", "cdp": "http://127.0.0.1:9221", "cookieFile": "G:\\cookies\\dola\\dola_1.txt" },
     { "id": "account-2", "cdp": "http://127.0.0.1:9223", "cookieFile": "G:\\cookies\\dola\\dola_2.txt" }
   ]
 }

@@ -6,7 +6,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { createHash } from "node:crypto";
 import path from "node:path";
 
-const DEFAULT_CDP = "http://127.0.0.1:9222";
+const DEFAULT_CDP = "http://127.0.0.1:9221";
 const DEFAULT_SESSION = "https://www.dola.com/chat/38415631468262161";
 const DOLA_CHAT_HOME = "https://www.dola.com/chat";
 const DOLA_IMAGE_HOME = "https://www.dola.com/chat/create-image";
@@ -26,15 +26,16 @@ function usage() {
   console.log(`dola-cli
 
 Submit a message, optionally with local image/file attachments, to Dola chat
-through an existing Chrome session exposed on CDP port 9222.
+through an existing Chrome session exposed on CDP port 9221.
 
 Usage:
   bun src/cli.js --session <dola-chat-url|id> --prompt <text> [options]
   bun src/cli.js --new-chat --prompt <text> [options]
   bun src/cli.js --new-chat --batch-prompt-file <path> [options]
+  bun src/cli.js --new-chat --video-gen --prompt <text> [options]
 
 Prerequisites:
-  1. Start Chrome with --remote-debugging-port=9222.
+  1. Start Chrome with --remote-debugging-port=9221.
   2. Log in to https://www.dola.com manually.
   3. Use --session for an existing chat, or --new-chat for Dola chat home.
 
@@ -72,18 +73,24 @@ Options:
                            Re-upload the character image every n prompts. Default: 10
   --file <path>            Attach a local file before submitting. Can be repeated.
   --attach <path>          Alias for --file.
+  --reference-image <path> Alias for --file in video mode. Can be repeated.
   --cdp <url>              Chrome CDP endpoint. Default: ${DEFAULT_CDP}
   --timeout <ms>           Max wait time after submit. Default: 120000
   --stable <ms>            Response text stability window. Default: 3000
   --max-retries <n>        Automatic retries after timeout/submit failure. Default: 2
   --image-gen              Enable Dola image generation and download images from the last reply only.
+  --video-gen              Enable Dola video generation and download videos from the last reply only.
+  --duration <seconds>     Video duration. Supported values depend on Dola (default: 5).
+  --aspect-ratio <ratio>   Video aspect ratio, for example 16:9, 9:16, or 1:1.
   --out <path>             Image download directory. Default: ${DEFAULT_OUT_DIR}
   --count <n>              Number of images to download. Default: 1
   --no-download            Generate images without downloading them.
+  --download-last-video    Download the newest video already generated in the current chat.
   --allow-watermark        Permit watermarked image URLs when no raw URL is available.
   --no-wait                Submit only; do not wait for response text.
   --debug-ui               Print visible input/button candidates and exit.
   --debug-images           Print captured image URLs and exit.
+  --debug-video-menu        Open the newest video card's More menu and print UI diagnostics.
   --dry-run                Validate CDP/session only; do not submit a prompt.
   -h, --help               Show this help.
 
@@ -115,6 +122,9 @@ function parseArgs(argv) {
     else if (arg === "--session-state") args.sessionState = value();
     else if (arg === "--account-pool") args.accountPool = value();
     else if (arg === "--image-gen" || arg === "--image-generation") args.imageGen = true;
+    else if (arg === "--video-gen" || arg === "--video-generation") args.videoGen = true;
+    else if (arg === "--duration" || arg === "--video-duration") args.duration = value();
+    else if (arg === "--aspect-ratio" || arg === "--ratio") args.aspectRatio = value();
     else if (arg === "--prompt") args.prompt = value();
     else if (arg === "--prompt-file") args.promptFile = value();
     else if (arg === "--batch-prompt-file") args.batchPromptFile = value();
@@ -123,7 +133,7 @@ function parseArgs(argv) {
     else if (arg === "--character-image") args.characterImage = value();
     else if (arg === "--character-prompt") args.characterPrompt = value();
     else if (arg === "--character-batch-size") args.characterBatchSize = Number(value());
-    else if (arg === "--file" || arg === "--attach") args.files.push(value());
+    else if (arg === "--file" || arg === "--attach" || arg === "--reference-image") args.files.push(value());
     else if (arg === "--cdp") args.cdp = value();
     else if (arg === "--out") args.out = value();
     else if (arg === "--count") args.count = Number(value());
@@ -132,9 +142,11 @@ function parseArgs(argv) {
     else if (arg === "--max-retries") args.maxRetries = Number(value());
     else if (arg === "--no-wait") args.noWait = true;
     else if (arg === "--no-download") args.noDownload = true;
+    else if (arg === "--download-last-video") args.downloadLastVideo = true;
     else if (arg === "--allow-watermark") args.allowWatermark = true;
     else if (arg === "--debug-ui") args.debugUi = true;
     else if (arg === "--debug-images") args.debugImages = true;
+    else if (arg === "--debug-video-menu") args.debugVideoMenu = true;
     else if (arg === "--dry-run") args.dryRun = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
@@ -167,6 +179,24 @@ function parseArgs(argv) {
     if (args.noWait) throw new Error("--batch-prompt-file cannot be combined with --no-wait.");
     args.imageGen = true;
   }
+  if (args.downloadLastVideo) args.videoGen = true;
+  if (args.imageGen && args.videoGen) throw new Error("--image-gen and --video-gen cannot be combined.");
+  if ((args.duration !== undefined || args.aspectRatio !== undefined) && !args.videoGen) {
+    throw new Error("--duration and --aspect-ratio require --video-gen.");
+  }
+  if (args.videoGen && args.duration !== undefined) {
+    const duration = Number(args.duration);
+    if (!Number.isFinite(duration) || duration <= 0 || duration > 60) {
+      throw new Error("--duration must be a number between 1 and 60 seconds.");
+    }
+    args.duration = String(args.duration);
+  }
+  if (args.videoGen && args.aspectRatio !== undefined && !/^\d+(?::\d+|\/\d+)$/.test(String(args.aspectRatio).trim())) {
+    throw new Error("--aspect-ratio must look like 16:9, 9:16, or 1:1.");
+  }
+  // Dola normally finishes video generation in 1-5 minutes. Keep the image
+  // default for existing commands, while giving video jobs a practical window.
+  if (args.videoGen && args.timeout === 120000) args.timeout = 360000;
   if (args.resume && !args.batchPromptFile) throw new Error("--resume requires --batch-prompt-file.");
   return args;
 }
@@ -413,11 +443,23 @@ function isLikelyImageUrl(url) {
     return false;
   }
   if (/\/(api|web|passport)\//i.test(parsed.pathname)) return false;
-  if (/\.(png|jpe?g|webp|gif)(\?|$)/i.test(url)) return true;
+  if (/\.(png|jpe?g|webp|gif|mp4|webm|mov|m4v)(\?|$)/i.test(url)) return true;
   const hostLooksImage = /dola|byteimg|bytedance|volc|tos|cdn|image|img/i.test(parsed.hostname);
-  const pathLooksImage = /image|img|tplv|tos-|obj\/|origin|raw|large|webp|jpeg|jpg|png/i.test(parsed.pathname);
+  const pathLooksImage = /image|img|video|mp4|webm|tplv|tos-|obj\/|origin|raw|large|webp|jpeg|jpg|png/i.test(parsed.pathname);
   const queryLooksSigned = /x-expires|expires|sign|signature|format|image|img|tplv|raw|origin|width|height/i.test(parsed.search);
   return hostLooksImage && pathLooksImage && queryLooksSigned;
+}
+
+function isLikelyVideoUrl(url) {
+  if (!url || typeof url !== "string" || !/^https?:\/\//i.test(url)) return false;
+  try {
+    const parsed = new URL(url);
+    if (/\.(mp4|webm|mov|m4v)(\?|$)/i.test(url)) return true;
+    return /rc_gen_video|video|vid/i.test(parsed.pathname)
+      && /dola|byte|bytedance|volc|tos|cdn/i.test(parsed.hostname);
+  } catch {
+    return false;
+  }
 }
 
 function isWatermarkedUrl(url) {
@@ -427,17 +469,17 @@ function isWatermarkedUrl(url) {
 function isPreferredRawUrl(url) {
   if (isWatermarkedUrl(url)) return false;
   if (/(image_raw|raw|origin|original|ori|source|large|no[_-]?watermark|without[_-]?watermark)/i.test(url || "")) return true;
-  if (/rc_gen_image\/[a-f0-9]{16,64}\.(jpeg|jpg|png|webp)(\?|$)/i.test(url || "")) return true;
+  if (/rc_gen_(?:image|video)\/[a-f0-9]{16,64}\.(jpeg|jpg|png|webp|mp4|webm)(\?|$)/i.test(url || "")) return true;
   return false;
 }
 
 function imageKeyFromUrl(url) {
   const text = String(url || "");
-  const match = /rc_gen_image\/([a-f0-9]{16,64})(?:preview)?\.(?:jpeg|jpg|png|webp)/i.exec(text)
-    || /rc_gen_image\/([^~?/#]+)(?:~|\?|$)/i.exec(text);
+  const match = /rc_gen_(?:image|video)\/([a-f0-9]{16,64})(?:preview)?\.(?:jpeg|jpg|png|webp|mp4|webm)/i.exec(text)
+    || /rc_gen_(?:image|video)\/([^~?/#]+)(?:~|\?|$)/i.exec(text);
   if (!match) return "";
   const filename = match[1].includes(".") ? match[1] : `${match[1]}.jpeg`;
-  return `rc_gen_image/${filename.replace(/preview\.(jpeg|jpg|png|webp)$/i, ".$1")}`;
+  return text.match(/rc_gen_video/i) ? `rc_gen_video/${filename.replace(/preview\.(mp4|webm)$/i, ".$1")}` : `rc_gen_image/${filename.replace(/preview\.(jpeg|jpg|png|webp)$/i, ".$1")}`;
 }
 
 function normalizeImageKey(value) {
@@ -456,7 +498,7 @@ function collectImageUrls(value, found = new Set()) {
   }
   if (typeof value === "object") {
     for (const [key, item] of Object.entries(value)) {
-      if (/url|uri|src|image|origin|original|raw|large|watermark/i.test(key)) collectImageUrls(item, found);
+      if (/url|uri|src|image|video|origin|original|raw|large|watermark/i.test(key)) collectImageUrls(item, found);
       else if (typeof item === "object") collectImageUrls(item, found);
     }
   }
@@ -475,7 +517,7 @@ function extractImageRecordsFromJson(value, records = []) {
 
     const urls = [];
     for (const [key, item] of Object.entries(node)) {
-      if (/url|uri|src|image|origin|original|raw|large|watermark/i.test(key)) {
+      if (/url|uri|src|image|video|origin|original|raw|large|watermark/i.test(key)) {
         for (const url of collectImageUrls(item)) urls.push(url);
       }
     }
@@ -560,8 +602,12 @@ class CdpClient {
   }
 }
 
-async function findOrCreateTarget(cdp, sessionUrl, forceNew = false) {
+async function findOrCreateTarget(cdp, sessionUrl, forceNew = false, preferExistingDola = false) {
   const targets = await fetch(cdpHttpUrl(cdp, "/json/list")).then(r => r.json());
+  if (preferExistingDola) {
+    const existing = targets.find(item => item.type === "page" && /(^|\.)dola\.com\/chat/i.test(item.url || ""));
+    if (existing) return existing;
+  }
   if (!forceNew) {
     const exact = targets.find(item => item.type === "page" && item.url === sessionUrl);
     if (exact) return exact;
@@ -717,6 +763,96 @@ async function ensureImageGenerationMode(client) {
   console.log("[dola-cli] image generation mode ready");
 }
 
+async function ensureVideoGenerationMode(client) {
+  const state = await evaluate(client, `(() => {
+    const videoTexts = ["视频生成", "生成视频", "Create Video", "Video Generation", "Text to Video", "Image to Video"];
+    const videoRegex = /video|视频/i;
+    const visible = el => {
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const textOf = el => [el.innerText, el.textContent, el.getAttribute("aria-label"), el.title, el.className, el.id].join(" ");
+    const active = el => el.getAttribute("aria-selected") === "true"
+      || el.getAttribute("data-state") === "active" || el.getAttribute("data-checked") === "true";
+    if (Array.from(document.querySelectorAll('[data-input-engine-actionbar-control-key="video-duration"], [data-input-engine-actionbar-control-key="video-ratio"]')).some(visible)) {
+      return { ok: true, already: true };
+    }
+    const buttons = Array.from(document.querySelectorAll("button, [role='button'], a, [data-value]")).filter(visible);
+    if (buttons.some(el => videoTexts.some(t => textOf(el).includes(t)) && active(el))) return { ok: true, already: true };
+    const candidates = buttons.map(el => {
+      const plain = el.innerText || el.textContent || "";
+      const text = textOf(el);
+      let score = 0;
+      if (videoTexts.some(t => plain.includes(t))) score += 200;
+      if (videoRegex.test(text)) score += 120;
+      if (el.getBoundingClientRect().y > innerHeight * 0.55) score += 20;
+      return { el, score, rect: el.getBoundingClientRect(), text: text.trim().slice(0, 120) };
+    }).filter(item => item.score > 0).sort((a, b) => b.score - a.score);
+    const item = candidates[0];
+    return item ? { ok: true, already: false, text: item.text, x: item.rect.x + item.rect.width / 2, y: item.rect.y + item.rect.height / 2 } : { ok: false, error: "No video generation button found." };
+  })()`);
+  if (!state?.ok) throw new Error(state?.error || "No video generation button found.");
+  if (!state.already) {
+    await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: state.x, y: state.y, button: "left", clickCount: 1 });
+    await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: state.x, y: state.y, button: "left", clickCount: 1 });
+    const started = Date.now();
+    while (Date.now() - started < 5000) {
+      const ready = await evaluate(client, `(() => {
+        const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden"; };
+        return Array.from(document.querySelectorAll('[data-input-engine-actionbar-control-key="video-duration"], [data-input-engine-actionbar-control-key="video-ratio"]')).some(visible);
+      })()`).catch(() => false);
+      if (ready) break;
+      await sleep(250);
+    }
+  }
+  const controlsReady = await evaluate(client, `(() => {
+    const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden"; };
+    return Array.from(document.querySelectorAll('[data-input-engine-actionbar-control-key="video-duration"], [data-input-engine-actionbar-control-key="video-ratio"]')).some(visible);
+  })()`).catch(() => false);
+  if (!controlsReady) throw new Error("Video generation form did not appear after selecting the video mode.");
+  console.log("[dola-cli] video generation mode ready");
+}
+
+async function selectVideoOptions(client, options = {}) {
+  if (!options.videoGen || (!options.duration && !options.aspectRatio)) return;
+  const click = async point => {
+    await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 });
+    await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 });
+  };
+  const choose = async (controlKey, value) => {
+    const trigger = await evaluate(client, `(() => {
+      const el = document.querySelector('[data-input-engine-actionbar-control-key=${JSON.stringify(controlKey)}]');
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return r.width && r.height ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null;
+    })()`).catch(() => null);
+    if (!trigger) return false;
+    await click(trigger);
+    await sleep(300);
+    const option = await evaluate(client, `(() => {
+      const wanted = ${JSON.stringify(String(value))}.replace(/\\s/g, "").toLowerCase();
+      const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden"; };
+      const text = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || "").replace(/\\s/g, "").toLowerCase();
+      const candidates = Array.from(document.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-collection-item], button, label')).filter(visible);
+      const el = candidates.find(item => text(item) === wanted || text(item) === wanted + "s");
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    })()`).catch(() => null);
+    if (!option) return false;
+    await click(option);
+    await sleep(250);
+    return true;
+  };
+  const result = [];
+  if (options.duration && await choose("video-duration", options.duration)) result.push(String(options.duration));
+  if (options.aspectRatio && await choose("video-ratio", options.aspectRatio)) result.push(String(options.aspectRatio));
+  if (result?.length) console.log(`[dola-cli] video options selected: ${result.join(", ")}`);
+  const missing = [options.duration, options.aspectRatio].filter(Boolean).filter(value => !result?.includes(String(value)));
+  if (missing.length) throw new Error(`Video option control or choice not found: ${missing.join(", ")}`);
+}
+
 async function attachFiles(client, files) {
   if (!files.length) return [];
   await client.send("DOM.enable");
@@ -841,7 +977,11 @@ async function submitPrompt(client, promptText, options = {}) {
   await sleep(100);
   await client.send("Input.insertText", { text: promptText });
   await syncInputText(client, promptText);
-  if (options.imageGen) {
+  if (options.videoGen) {
+    await ensureVideoGenerationMode(client);
+    await selectVideoOptions(client, options);
+    await syncInputText(client, promptText);
+  } else if (options.imageGen) {
     await ensureImageGenerationMode(client);
     await syncInputText(client, promptText);
   }
@@ -858,14 +998,19 @@ async function submitPrompt(client, promptText, options = {}) {
     await sleep(1000);
   }
 
-  const stillThere = await evaluate(client, `(() => {
-    const el = Array.from(document.querySelectorAll("textarea, input[type='text'], [contenteditable='true'], [role='textbox']")).filter(el => {
-      const rect = el.getBoundingClientRect();
-      const style = getComputedStyle(el);
-      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-    }).at(-1);
-    return el ? (el.value || el.innerText || el.textContent || "") : "";
-  })()`).catch(() => "");
+  let stillThere = "";
+  for (let checkAttempt = 0; checkAttempt < 3; checkAttempt += 1) {
+    stillThere = await evaluate(client, `(() => {
+      const el = Array.from(document.querySelectorAll("textarea, input[type='text'], [contenteditable='true'], [role='textbox']")).filter(el => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      }).at(-1);
+      return el ? (el.value || el.innerText || el.textContent || "") : "";
+    })()`).catch(() => "");
+    if (!stillThere.includes(promptText)) break;
+    await sleep(2000);
+  }
   if (stillThere.includes(promptText)) {
     throw new Error("Prompt text is still in the input after submit; Dola did not accept the message.");
   }
@@ -948,20 +1093,20 @@ async function installImageHook(client) {
         const parsed = new URL(url || "");
         if (!/^https?:$/i.test(parsed.protocol)) return false;
         if (/\\/(api|web|passport)\\//i.test(parsed.pathname)) return false;
-        if (/\\.(png|jpe?g|webp|gif)(\\?|$)/i.test(url)) return true;
+         if (/\\.(png|jpe?g|webp|gif|mp4|webm|mov|m4v)(\\?|$)/i.test(url)) return true;
         return /dola|byteimg|bytedance|volc|tos|cdn|image|img/i.test(parsed.hostname)
-          && /image|img|tplv|tos-|obj\\/|origin|raw|large|webp|jpeg|jpg|png/i.test(parsed.pathname)
+           && /image|img|video|mp4|webm|tplv|tos-|obj\\/|origin|raw|large|webp|jpeg|jpg|png/i.test(parsed.pathname)
           && /x-expires|expires|sign|signature|format|image|img|tplv|raw|origin|width|height/i.test(parsed.search);
       } catch { return false; }
     };
     const isWatermarked = url => /watermark|downsize_watermark|image_dld_watermark|image_pre_watermark|hcg_watermark|img_pre_mark|wm_|with[_-]?water|marked|logo/i.test(url || "");
     const isRaw = url => /(image_raw|raw|origin|original|ori|source|large|no[_-]?watermark|without[_-]?watermark)/i.test(url || "") && !isWatermarked(url);
     const imageKey = url => {
-      const match = /rc_gen_image\\/([a-f0-9]{16,64})(?:preview)?\\.(?:jpeg|jpg|png|webp)/i.exec(String(url || ""))
-        || /rc_gen_image\\/([^~?/#]+)(?:~|\\?|$)/i.exec(String(url || ""));
+       const match = /rc_gen_(?:image|video)\\/([a-f0-9]{16,64})(?:preview)?\\.(?:jpeg|jpg|png|webp|mp4|webm)/i.exec(String(url || ""))
+         || /rc_gen_(?:image|video)\\/([^~?/#]+)(?:~|\\?|$)/i.exec(String(url || ""));
       if (!match) return "";
       const filename = match[1].includes(".") ? match[1] : match[1] + ".jpeg";
-      return "rc_gen_image/" + filename.replace(/preview\\.(jpeg|jpg|png|webp)$/i, ".$1");
+       return /rc_gen_video/i.test(url) ? "rc_gen_video/" + filename.replace(/preview\\.(mp4|webm)$/i, ".$1") : "rc_gen_image/" + filename.replace(/preview\\.(jpeg|jpg|png|webp)$/i, ".$1");
     };
     const push = (url, context = {}) => {
       if (!okUrl(url)) return;
@@ -978,7 +1123,7 @@ async function installImageHook(client) {
         prompt: node.prompt || node.query || node.input || context.prompt || "",
       };
       for (const [key, item] of Object.entries(node)) {
-        if (/url|uri|src|image|origin|original|raw|large|watermark/i.test(key)) {
+         if (/url|uri|src|image|video|origin|original|raw|large|watermark/i.test(key)) {
           if (typeof item === "string") push(item, next);
           else visit(item, next);
         } else if (typeof item === "object") {
@@ -989,7 +1134,7 @@ async function installImageHook(client) {
     JSON.parse = function dolaCliParse(text, reviver) {
       const data = originalParse.call(this, text, reviver);
       try {
-        if (typeof text === "string" && /image|img|url|raw|origin|watermark/i.test(text)) visit(data);
+         if (typeof text === "string" && /image|img|video|url|raw|origin|watermark/i.test(text)) visit(data);
       } catch {}
       return data;
     };
@@ -1019,11 +1164,11 @@ function rawUrlFromTrackKey(trackKey, origin) {
 
 async function collectDomImages(client) {
   const urls = await evaluate(client, `(() => {
-    const out = Array.from(document.querySelectorAll('img[alt="image"][data-track-key]'))
-      .filter(img => img.naturalWidth >= 256 && img.naturalHeight >= 256)
-      .map(img => {
-        const src = img.currentSrc || img.src || "";
-        const key = img.getAttribute("data-track-key") || "";
+    const out = Array.from(document.querySelectorAll('img[alt="image"][data-track-key], video, video source[src]'))
+      .filter(media => media.tagName === "VIDEO" || media.naturalWidth >= 256 && media.naturalHeight >= 256)
+      .map(media => {
+        const src = media.currentSrc || media.src || media.getAttribute("src") || "";
+        const key = media.getAttribute("data-track-key") || "";
         const rawUrl = (() => {
           if (!key || !src) return "";
           const path = key.replace(/^\d+_\d+_/, "");
@@ -1033,8 +1178,8 @@ async function collectDomImages(client) {
         return {
           url: rawUrl || src,
           key: key,
-          width: img.naturalWidth,
-          height: img.naturalHeight,
+           width: media.videoWidth || media.naturalWidth || 0,
+           height: media.videoHeight || media.naturalHeight || 0,
         };
       });
     return out;
@@ -1047,6 +1192,67 @@ async function collectDomImages(client) {
     width: item.width,
     height: item.height,
   })));
+}
+
+async function activateLatestVideoPlayer(client) {
+  const point = await evaluate(client, `(() => {
+    const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden"; };
+    const item = Array.from(document.querySelectorAll('[class*="block-video"]')).filter(visible).at(-1);
+    if (!item) return null;
+    const trigger = item.querySelector('[class*="play-icon"]') || item;
+    trigger.click();
+    const r = trigger.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  })()`).catch(() => null);
+  if (!point) return false;
+  await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 });
+  await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 });
+  await sleep(750);
+  return true;
+}
+
+async function hoverLatestVideoCard(client) {
+  const point = await evaluate(client, `(() => {
+    const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden"; };
+    const item = Array.from(document.querySelectorAll('[class*="block-video"]')).filter(visible).at(-1);
+    if (!item) return null;
+    const r = item.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  })()`).catch(() => null);
+  if (!point) return false;
+  await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y });
+  await sleep(300);
+  return true;
+}
+
+async function openLatestVideoMoreMenu(client) {
+  const point = await evaluate(client, `(() => {
+    const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden"; };
+    const candidates = Array.from(document.querySelectorAll("button, [role='button'], div, [aria-label], [title]"))
+      .filter(visible)
+      .filter(el => (el.innerText || el.textContent || el.getAttribute("aria-label") || el.title || "").includes("更多"))
+      .sort((a, b) => (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height));
+    const el = candidates[0];
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  })()`).catch(() => null);
+  if (!point) throw new Error("Could not find the newest video card's More button.");
+  await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 });
+  await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 });
+  await sleep(300);
+}
+
+async function collectDomVideos(client) {
+  const urls = await evaluate(client, `Array.from(document.querySelectorAll("video, video source"))
+    .map(el => el.currentSrc || el.src || el.getAttribute("src") || "")
+    .filter(Boolean)`).catch(() => []);
+  return (urls || []).filter(isLikelyVideoUrl).map(url => ({
+    url,
+    key: imageKeyFromUrl(url),
+    raw: isPreferredRawUrl(url),
+    watermarked: false,
+  }));
 }
 
 async function lastReplySnapshot(client) {
@@ -1064,7 +1270,7 @@ async function lastReplySnapshot(client) {
     const textOf = el => (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
     const inputBoxes = Array.from(document.querySelectorAll("textarea, input[type='text'], [contenteditable='true'], [role='textbox']")).filter(visible);
     const composerTop = inputBoxes.length ? Math.min(...inputBoxes.map(el => el.getBoundingClientRect().top)) : Number.POSITIVE_INFINITY;
-    const generatedImageSelector = 'img[alt="image"][data-track-key]';
+     const generatedImageSelector = 'img[alt="image"][data-track-key], video[src], video source[src]';
     const messageSelector = [
       "[data-message-id]",
       "[data-testid*='message' i]",
@@ -1103,11 +1309,11 @@ async function lastReplySnapshot(client) {
       .map(node => {
         const rect = rectOf(node);
         const text = textOf(node);
-        const imgs = Array.from(node.querySelectorAll(generatedImageSelector))
+         const imgs = Array.from(node.querySelectorAll(generatedImageSelector))
           .filter(visible)
-          .filter(img => img.naturalWidth >= 128 && img.naturalHeight >= 128)
+           .filter(img => img.tagName === "VIDEO" || img.naturalWidth >= 128 && img.naturalHeight >= 128)
           .map(img => ({
-            url: img.currentSrc || img.src || "",
+             url: img.currentSrc || img.src || img.getAttribute("src") || "",
             key: img.getAttribute("data-track-key") || "",
             width: img.naturalWidth,
             height: img.naturalHeight
@@ -1170,6 +1376,9 @@ function messageIdFromRecord(item) {
 
 function classifyImageGenerationTextError(text) {
   const value = String(text || "").trim();
+  // Generation progress text (which often echoes the prompt containing words like "限制")
+  // should not be misclassified as a quota or refusal error.
+  if (looksLikeImageGenerationProgress(value)) return "IMAGE_GENERATION_TEXT_RESPONSE";
   if (/账号受限|账户受限|账号封禁|账户封禁|account.*(?:restricted|suspended|disabled)|too many requests|rate limit/i.test(value)) {
     return "ACCOUNT_RESTRICTED";
   }
@@ -1184,7 +1393,9 @@ function isAccountRestrictedError(error) {
 }
 
 function looksLikeImageGenerationProgress(text) {
-  return /generate(?:d|ing)?\s+image|will\s+generate|starting\s+to\s+generate|generating|正在生成|生成中|开始生成|即将生成|请稍候|请稍等|稍等/i.test(String(text || ""));
+  const value = String(text || "");
+  return /generate(?:d|ing)?\s+image|will\s+generate|starting\s+to\s+generate|generating|正在生成|生成中|开始生成|即将生成|请稍候|请稍等|稍等/i.test(value)
+    || /正在.*生成|生成.*图片|生成.*场景|正在为您|视频生成.*(?:需要|大约)|(?:视频|video).*(?:1\s*[-–~到]\s*[35]\s*(?:分钟|minutes?)|生成好|完成后).*(?:发送|send)/i.test(value);
 }
 
 function looksLikePromptEcho(text, promptText) {
@@ -1221,6 +1432,7 @@ function recordsFromLastReply(lastReply) {
 function chooseDownloadItems(records, beforeUrls, options) {
   const fresh = uniqueImageRecords(records)
     .filter(item => !beforeUrls.has(item.url))
+    .filter(item => !options.videoGen || isLikelyVideoUrl(item.url))
     .filter(item => {
       const key = normalizeImageKey(item.key || item.url);
       return !key || !options.beforeImageKeys?.has(key);
@@ -1237,7 +1449,7 @@ function chooseDownloadItems(records, beforeUrls, options) {
     return item;
   });
   const clean = resolved.filter(item => !item.watermarked);
-  const generated = clean.filter(item => item.key || /rc_gen_image/i.test(item.url));
+  const generated = clean.filter(item => options.videoGen ? isLikelyVideoUrl(item.url) : item.key || /rc_gen_(?:image|video)/i.test(item.url));
   const preferred = clean.filter(item => item.raw);
   const fallbackAny = options.allowWatermark || options.watermarkFallback ? resolved : [];
   // Sort generated candidates by message id descending so the most recent image wins
@@ -1262,14 +1474,41 @@ async function recoverPendingDownload(client, capturedRecords, inFlight, options
     capturedRecords.push(...recordsFromLastReply(lastReply));
     capturedRecords.push(...await collectHookImages(client));
     capturedRecords.push(...await collectDomImages(client));
+    if (options.videoGen) capturedRecords.push(...await collectDomVideos(client));
     const selected = chooseDownloadItems(capturedRecords, beforeUrls, {
       ...options,
       beforeImageKeys,
       lastReply,
     });
-    if (selected.length >= options.count && selected.some(item => item.key || /rc_gen_image/i.test(item.url))) return selected;
+    if (selected.length >= options.count && selected.some(item => item.key || /rc_gen_(?:image|video)/i.test(item.url))) return selected;
     await sleep(1000);
   }
+  // Fallback: collect the most recent generated images visible on the page.
+  // This handles the case where images were already generated before the process was interrupted.
+  const domRecords = (await collectDomImages(client))
+    .filter(url => /rc_gen_(?:image|video)/i.test(url) && !beforeUrls.has(url))
+    .map(url => ({
+      url,
+      key: imageKeyFromUrl(url),
+      message_id: "",
+      conversation_id: "",
+      raw: isPreferredRawUrl(url),
+      watermarked: isWatermarkedUrl(url),
+    }));
+  const candidateMap = new Map();
+  for (const item of uniqueImageRecords([...capturedRecords, ...domRecords])) {
+    if (!/rc_gen_(?:image|video)/i.test(item.url) || beforeUrls.has(item.url)) continue;
+    const key = normalizeImageKey(item.key || item.url);
+    if (!key) continue;
+    const existing = candidateMap.get(key);
+    if (!existing || (item.raw && !existing.raw) || (!item.watermarked && existing.watermarked)) {
+      candidateMap.set(key, item);
+    }
+  }
+  const fallback = Array.from(candidateMap.values())
+    .sort((a, b) => messageIdFromRecord(b) - messageIdFromRecord(a))
+    .slice(0, options.count);
+  if (fallback.length) return fallback;
   return null;
 }
 
@@ -1307,7 +1546,7 @@ async function imageGenerationUiSnapshot(client) {
       messageCount: messageNodes.length,
       assistantCount: assistantNodes.length,
       assistantShape: assistantNodes.slice(-3),
-      generatedImageCount: document.querySelectorAll("img[alt='image'][data-track-key]").length,
+      generatedImageCount: document.querySelectorAll("img[alt='image'][data-track-key], video[src], video source[src]").length,
       send: send ? { disabled: Boolean(send.disabled), ariaDisabled: send.getAttribute("aria-disabled") || "", loading: send.getAttribute("data-loading") || "" } : null,
       inputEmpty: !input || !(input.value || input.innerText || input.textContent || "").trim(),
     };
@@ -1356,6 +1595,8 @@ async function waitForImageGenerationComplete(client, options) {
 async function waitForDownloadItems(client, beforeUrls, capturedRecords, options) {
   await waitForImageGenerationComplete(client, options);
   const started = Date.now();
+  const pollMs = options.videoGen ? 60000 : 1000;
+  let pollCount = 0;
   let lastChange = Date.now();
   let lastCount = 0;
   // Anchor the reply once generation is complete. Dola can reorder/virtualize
@@ -1364,6 +1605,9 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
   let lastReply = anchoredReply;
   let lastReplyChange = Date.now();
   while (Date.now() - started < options.timeout) {
+    if (options.videoGen && pollCount > 0) {
+      console.log(`[dola-cli] video generation poll ${pollCount}: checking the current form reply`);
+    }
     if (!lastReply?.imageKeys?.length) {
       const replyWithImages = await lastReplySnapshot(client);
       if (replyWithImages?.imageKeys?.length) {
@@ -1372,9 +1616,11 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
         console.log(`[dola-cli] anchored last reply images=${lastReply.imageKeys.length} messageId=${lastReply.messageId || "unknown"}`);
       }
     }
+    if (options.videoGen) await activateLatestVideoPlayer(client);
     capturedRecords.push(...recordsFromLastReply(lastReply));
     capturedRecords.push(...await collectHookImages(client));
     capturedRecords.push(...await collectDomImages(client));
+    if (options.videoGen) capturedRecords.push(...await collectDomVideos(client));
     const scopedOptions = { ...options, lastReply };
     const selected = chooseDownloadItems(capturedRecords, beforeUrls, scopedOptions);
     const freshRecords = uniqueImageRecords(capturedRecords).filter(item => !beforeUrls.has(item.url));
@@ -1382,13 +1628,37 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
     if (freshCount !== lastCount) {
       lastCount = freshCount;
       lastChange = Date.now();
-      const generated = freshRecords.filter(item => item.key || /rc_gen_image/i.test(item.url)).length;
+      const generated = freshRecords.filter(item => item.key || /rc_gen_(?:image|video)/i.test(item.url)).length;
       const raw = freshRecords.filter(item => item.raw && !item.watermarked).length;
       const watermarked = freshRecords.filter(item => item.watermarked).length;
       console.log(`[dola-cli] captured ${freshCount} image URL(s), generated=${generated}, raw=${raw}, watermarked=${watermarked}, selected=${selected.length}`);
     }
-    const hasGenerated = selected.some(item => item.key || /rc_gen_image/i.test(item.url));
+    const hasGenerated = selected.some(item => options.videoGen ? isLikelyVideoUrl(item.url) : item.key || /rc_gen_(?:image|video)/i.test(item.url));
     if (selected.length >= options.count && hasGenerated && Date.now() - lastChange >= options.stable) return selected;
+    // Fallback: if no item was matched against the last reply but fresh generated images exist,
+    // return the best available candidates. This handles cases where Dola's reply/image
+    // association cannot be detected reliably.
+    if (selected.length === 0 && Date.now() - lastChange >= options.stable) {
+      const generatedRecords = freshRecords.filter(item => options.videoGen ? isLikelyVideoUrl(item.url) : item.key || /rc_gen_(?:image|video)/i.test(item.url));
+      if (generatedRecords.length) {
+        const candidateMap = new Map();
+        for (const item of generatedRecords) {
+          const key = normalizeImageKey(item.key || item.url);
+          if (!key) continue;
+          const existing = candidateMap.get(key);
+          if (!existing || (item.raw && !existing.raw) || (!item.watermarked && existing.watermarked)) {
+            candidateMap.set(key, item);
+          }
+        }
+        const fallback = Array.from(candidateMap.values())
+          .sort((a, b) => messageIdFromRecord(b) - messageIdFromRecord(a))
+          .slice(0, options.count);
+        if (fallback.length) {
+          console.log(`[dola-cli] using fallback image selection: ${fallback.length} candidate(s)`);
+          return fallback;
+        }
+      }
+    }
     const replyIsFinalText = lastReply?.signature
       && lastReply.signature !== options.beforeLastReply?.signature
       && !lastReply.imageKeys?.length
@@ -1398,17 +1668,19 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
       const code = classifyImageGenerationTextError(lastReply.text);
       const progressOnly = code === "IMAGE_GENERATION_TEXT_RESPONSE"
         && looksLikeImageGenerationProgress(lastReply.text);
-      if (!looksLikePromptEcho(lastReply.text, options.promptText) && !progressOnly) {
+      const echo = looksLikePromptEcho(lastReply.text, options.promptText);
+      if (!echo && !progressOnly) {
         throw new DolaCliError(code, `Image generation returned text instead of images: ${lastReply.text.slice(0, 300)}`, { lastReply });
       }
     }
-    await sleep(1000);
+    pollCount += 1;
+    await sleep(pollMs);
   }
   const finalReply = await lastReplySnapshot(client);
   capturedRecords.push(...recordsFromLastReply(finalReply));
   const scopedOptions = { ...options, lastReply: finalReply.signature ? finalReply : lastReply };
   const selected = chooseDownloadItems(capturedRecords, beforeUrls, scopedOptions);
-  const hasGenerated = selected.some(item => item.key || /rc_gen_image/i.test(item.url));
+  const hasGenerated = selected.some(item => options.videoGen ? isLikelyVideoUrl(item.url) : item.key || /rc_gen_(?:image|video)/i.test(item.url));
   if (selected.length && hasGenerated) return selected;
   const reply = scopedOptions.lastReply;
   if (reply?.signature && reply.signature !== options.beforeLastReply?.signature && !reply.imageKeys?.length && reply.text) {
@@ -1430,7 +1702,10 @@ async function waitForDownloadItems(client, beforeUrls, capturedRecords, options
 
 function extensionFromUrl(url, contentType) {
   const ext = path.extname(new URL(url).pathname).replace(".", "").toLowerCase();
-  if (["png", "jpg", "jpeg", "webp", "gif"].includes(ext)) return ext;
+  if (["png", "jpg", "jpeg", "webp", "gif", "mp4", "webm", "mov", "m4v"].includes(ext)) return ext;
+  if (/mp4/i.test(contentType || "")) return "mp4";
+  if (/webm/i.test(contentType || "")) return "webm";
+  if (/quicktime/i.test(contentType || "")) return "mov";
   if (/png/i.test(contentType || "")) return "png";
   if (/webp/i.test(contentType || "")) return "webp";
   if (/gif/i.test(contentType || "")) return "gif";
@@ -1453,18 +1728,21 @@ async function downloadImages(items, outDir, options = {}) {
     let lastDownloadError;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
-        response = await fetch(item.url, { headers: { "user-agent": "Mozilla/5.0", accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8" } });
+        response = await fetch(item.url, { headers: { "user-agent": "Mozilla/5.0", accept: "video/mp4,video/webm,image/avif,image/webp,image/apng,image/*,*/*;q=0.8", referer: "https://www.dola.com/" } });
         if (response.ok) break;
         lastDownloadError = new Error(`Download failed ${response.status}: ${item.url}`);
       } catch (error) {
         lastDownloadError = error;
       }
       if (attempt < 3) {
-        console.log(`[dola-cli] image download retry ${attempt + 1}/3`);
+        console.log(`[dola-cli] image download retry ${attempt + 1}/3: ${lastDownloadError?.message || "unknown error"}`);
         await sleep(attempt * 1000);
       }
     }
-    if (!response?.ok) throw lastDownloadError || new Error(`Download failed: ${item.url}`);
+    if (!response?.ok) {
+      console.error(`[dola-cli] image download failed for ${item.url}: ${lastDownloadError?.message || "unknown error"}`);
+      throw lastDownloadError || new Error(`Download failed: ${item.url}`);
+    }
     const ext = extensionFromUrl(item.url, response.headers.get("content-type"));
     const bytes = Buffer.from(await response.arrayBuffer());
     const hash = createHash("sha256").update(bytes).digest("hex");
@@ -1497,7 +1775,7 @@ function installNetworkImageCapture(client, capturedRecords) {
   client.on("Network.responseReceived", params => {
     const url = params.response?.url;
     const mime = params.response?.mimeType || "";
-    if (/^image\//i.test(mime) && isLikelyImageUrl(url)) {
+    if ((/^image\//i.test(mime) || /^video\//i.test(mime)) && isLikelyImageUrl(url)) {
       capturedRecords.push({ url, key: imageKeyFromUrl(url), raw: isPreferredRawUrl(url), watermarked: isWatermarkedUrl(url) });
     }
     if (/json|text|event-stream/i.test(mime)) requestBodies.set(params.requestId, true);
@@ -1510,7 +1788,7 @@ function installNetworkImageCapture(client, capturedRecords) {
       const text = body.base64Encoded
         ? Buffer.from(body.body || "", "base64").toString("utf8")
         : body.body || "";
-      if (!/image|img|url|raw|origin|watermark/i.test(text)) return;
+      if (!/image|img|video|url|raw|origin|watermark/i.test(text)) return;
       for (const block of text.split(/\r?\n\r?\n/)) {
         const dataLines = block.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trim());
         const candidates = dataLines.length ? dataLines : [block.trim()];
@@ -1577,6 +1855,8 @@ async function uiSnapshot(client) {
           aria: el.getAttribute("aria-label") || "",
           title: el.title || "",
           disabled: Boolean(el.disabled || el.getAttribute("aria-disabled")),
+          dataValue: el.getAttribute("data-value") || "",
+          actionKey: el.getAttribute("data-input-engine-actionbar-control-key") || "",
           rect: rectOf(el),
         }))
         .slice(-120),
@@ -1644,6 +1924,32 @@ async function imageDebugSnapshot(client) {
           ancestry: ancestry(img),
         }))
         .filter(item => item.src && !item.src.startsWith("data:image/svg+xml"))
+        .slice(0, 120),
+      videos: Array.from(document.querySelectorAll("video, video source, a[href]"))
+        .map(el => ({
+          tag: el.tagName,
+          src: el.currentSrc || el.src || el.href || el.getAttribute("src") || "",
+          text: (el.innerText || el.textContent || el.getAttribute("aria-label") || el.title || "").trim().slice(0, 180),
+          visible: visible(el),
+          rect: rectOf(el),
+          ancestry: ancestry(el),
+        }))
+        .filter(item => item.src && (/video|mp4|webm|mov|download|下载/i.test(item.src + " " + item.text)))
+        .slice(0, 80),
+      videoActions: Array.from(document.querySelectorAll('[class*="block-video"], [class*="video-hover"]'))
+        .filter(visible)
+        .map(box => ({
+          text: (box.innerText || box.textContent || "").trim().slice(0, 300),
+          html: box.outerHTML.slice(0, 1600),
+          buttons: Array.from(box.querySelectorAll("button, [role='button'], a"))
+            .map(el => ({ text: (el.innerText || el.textContent || el.getAttribute("aria-label") || el.title || "").trim(), aria: el.getAttribute("aria-label") || "", title: el.title || "", href: el.href || "" }))
+            .slice(0, 20),
+        }))
+        .slice(-4),
+      videoResources: performance.getEntriesByType("resource")
+        .map(entry => entry.name)
+        .filter(url => /video|\.mp4|\.webm|watermark|origin|raw|download/i.test(url))
+        .slice(-120),
     };
   })()`);
 }
@@ -1676,8 +1982,8 @@ async function sendCharacterContext(client, imagePath, characterPrompt, options)
   await sleep(500);
 }
 
-async function openAccountSession(cdp, sessionUrl, forceNew, resume, account) {
-  const target = await findOrCreateTarget(cdp, sessionUrl, forceNew);
+async function openAccountSession(cdp, sessionUrl, forceNew, resume, account, preferExistingDola = false) {
+  const target = await findOrCreateTarget(cdp, sessionUrl, forceNew, preferExistingDola);
   if (!target?.webSocketDebuggerUrl) throw new Error("No page CDP target found.");
   const client = new CdpClient(target.webSocketDebuggerUrl);
   await client.connect();
@@ -1688,7 +1994,7 @@ async function openAccountSession(cdp, sessionUrl, forceNew, resume, account) {
   await applyAccountCookies(client, account);
 
   let currentUrl = await evaluate(client, "location.href");
-  if (currentUrl !== sessionUrl) {
+  if (currentUrl !== sessionUrl && !preferExistingDola) {
     console.log(`[dola-cli] navigating session ${currentUrl} -> ${sessionUrl}`);
     await client.send("Page.navigate", { url: sessionUrl });
     await waitForPageReady(client);
@@ -1725,20 +2031,20 @@ async function main() {
   if (activeAccount) {
     args.cdp = activeAccount.cdp;
     args.session = pendingRecoverySession
-      || (args.newChat ? DOLA_IMAGE_HOME : (activeAccount.session || args.session || savedState?.lastSessionUrl));
+      || (args.newChat ? (args.videoGen ? DOLA_CHAT_HOME : DOLA_IMAGE_HOME) : (activeAccount.session || args.session || savedState?.lastSessionUrl));
   }
   if (!args.session && !args.newChat && savedState?.lastSessionUrl) {
     args.session = savedState.lastSessionUrl;
     console.log(`[dola-cli] resuming remembered session ${args.session}`);
   }
-  if (args.newChat && !pendingRecoverySession) args.session = args.imageGen ? DOLA_IMAGE_HOME : DOLA_CHAT_HOME;
+  if (args.newChat && !pendingRecoverySession) args.session = (args.imageGen && !args.characterImage) ? DOLA_IMAGE_HOME : DOLA_CHAT_HOME;
   if (activeAccount && !args.newChat && !args.session) {
     throw new Error(`Account ${activeAccount.id} needs a session URL, or use --new-chat.`);
   }
   if (!args.session) args.session = await askRequired(`Dola chat session URL or id (required, example ${DEFAULT_SESSION}): `);
 
   let sessionUrl = normalizeSession(args.session);
-  const allPromptEntries = args.dryRun || args.debugUi || args.debugImages
+  const allPromptEntries = args.dryRun || args.debugUi || args.debugImages || args.debugVideoMenu || args.downloadLastVideo
     ? []
     : args.batchPromptFile
       ? await loadBatchPrompts(args.batchPromptFile)
@@ -1750,13 +2056,13 @@ async function main() {
     if (args.toLine !== undefined && line > args.toLine) return false;
     return true;
   });
-  const files = args.dryRun || args.debugUi || args.debugImages ? [] : await normalizeFiles(args.files);
-  const characterImage = args.dryRun || args.debugUi || args.debugImages
+  const files = args.dryRun || args.debugUi || args.debugImages || args.debugVideoMenu ? [] : await normalizeFiles(args.files);
+  const characterImage = args.dryRun || args.debugUi || args.debugImages || args.debugVideoMenu
     ? []
     : args.characterImage
       ? await normalizeFiles([args.characterImage])
       : [];
-  if (!args.dryRun && !args.debugUi && !args.debugImages && !promptEntries.length) throw new Error("prompt is required.");
+  if (!args.dryRun && !args.debugUi && !args.debugImages && !args.debugVideoMenu && !args.downloadLastVideo && !promptEntries.length) throw new Error("prompt is required.");
   const outputDir = path.resolve(args.out);
   const inferredCompleted = args.resume ? await inferCompletedOutput(outputDir) : [];
   const savedCompleted = args.resume && Array.isArray(savedState?.completed) ? savedState.completed : [];
@@ -1775,7 +2081,7 @@ async function main() {
   }
 
   console.log(`[dola-cli] connecting CDP ${args.cdp}`);
-  const opened = await openAccountSession(args.cdp, sessionUrl, Boolean(args.newChat || activeAccount), args.resume, activeAccount);
+  const opened = await openAccountSession(args.cdp, sessionUrl, Boolean((args.newChat || activeAccount) && !args.videoGen), args.resume, activeAccount, args.videoGen);
   let client = opened.client;
   let currentUrl = opened.currentUrl;
   const poolState = () => accountStateFields(accountPoolFile, activeAccount, restrictedAccounts);
@@ -1783,12 +2089,40 @@ async function main() {
   const before = await pageSnapshot(client);
   console.log(`[dola-cli] session ${currentUrl}`);
   if (args.debugUi) {
+    if (args.videoGen) {
+      await ensureVideoGenerationMode(client);
+      await selectVideoOptions(client, args);
+    }
     console.log(JSON.stringify({ ui: await uiSnapshot(client), generation: await imageGenerationUiSnapshot(client) }, null, 2));
     client.close();
     return;
   }
   if (args.debugImages) {
-    console.log(JSON.stringify({ images: await imageDebugSnapshot(client), lastReply: await lastReplySnapshot(client) }, null, 2));
+    const debugRecords = [];
+    installNetworkImageCapture(client, debugRecords);
+    if (args.videoGen) {
+      await activateLatestVideoPlayer(client);
+      await hoverLatestVideoCard(client);
+      await sleep(1000);
+    }
+    console.log(JSON.stringify({ images: await imageDebugSnapshot(client), lastReply: await lastReplySnapshot(client), captured: debugRecords }, null, 2));
+    client.close();
+    return;
+  }
+  if (args.debugVideoMenu) {
+    await activateLatestVideoPlayer(client);
+    await hoverLatestVideoCard(client);
+    await openLatestVideoMoreMenu(client);
+    console.log(JSON.stringify({ ui: await uiSnapshot(client), page: await pageSnapshot(client) }, null, 2));
+    client.close();
+    return;
+  }
+  if (args.downloadLastVideo) {
+    await activateLatestVideoPlayer(client);
+    const videos = await collectDomVideos(client);
+    if (!videos.length) throw new DolaCliError("VIDEO_GENERATION_NO_VIDEO", "No downloadable video was found in the current Dola chat.");
+    const downloaded = await downloadImages(videos.slice(-args.count), outputDir, { ...args, hashNaming: true });
+    console.log(JSON.stringify({ sessionUrl: currentUrl, videoGeneration: true, downloaded }, null, 2));
     client.close();
     return;
   }
@@ -1811,6 +2145,10 @@ async function main() {
   let forceCharacterContext = false;
   const switchRestrictedAccount = async (error, lineNumber) => {
     if (!accountPool.length || !activeAccount || !isAccountRestrictedError(error)) return false;
+    if (accountPool.length === 1) {
+      console.log(`[dola-cli] single-account pool; not marking ${activeAccount.id} as restricted, will retry/raise instead`);
+      return false;
+    }
     restrictedAccounts.add(activeAccount.id);
     await writeJsonFile(sessionStateFile, {
       ...(savedState || {}),
@@ -1828,9 +2166,9 @@ async function main() {
     activeAccount = nextAccount;
     args.cdp = activeAccount.cdp;
     sessionUrl = normalizeSession(args.newChat
-      ? DOLA_IMAGE_HOME
+      ? (args.videoGen ? DOLA_CHAT_HOME : DOLA_IMAGE_HOME)
       : (activeAccount.session || sessionUrl));
-    const nextOpened = await openAccountSession(args.cdp, sessionUrl, true, false, activeAccount);
+    const nextOpened = await openAccountSession(args.cdp, sessionUrl, !args.videoGen, false, activeAccount, args.videoGen);
     client = nextOpened.client;
     currentUrl = nextOpened.currentUrl;
     await installImageHook(client);
@@ -1854,14 +2192,14 @@ async function main() {
         ...args,
         count: 1,
         promptText,
-        watermarkFallback: Boolean(args.characterImage),
+        watermarkFallback: true,
       });
       if (recoveredItems) {
         const recoveredDownloaded = await downloadImages(recoveredItems, path.resolve(args.out), {
           ...args,
           lineNumber,
-          hashNaming: Boolean(args.characterImage),
-          watermarkFallback: Boolean(args.characterImage),
+          hashNaming: true,
+          watermarkFallback: true,
           seenHashes,
         });
         for (const item of recoveredDownloaded) {
@@ -1889,11 +2227,20 @@ async function main() {
         results.push({ index: index + 1, line: lineNumber, prompt: promptText, recovered: true, downloaded: recoveredDownloaded });
         continue;
       }
-      console.log(`[dola-cli] no recoverable image for interrupted line ${lineNumber}; opening a fresh image session`);
-      await client.send("Page.navigate", { url: DOLA_IMAGE_HOME });
+      const recoveryAnswer = await askRequired(
+        `[dola-cli] 中断的第 ${lineNumber} 条在原会话中没有确认到图片。请检查 Dola 页面；确认确实没有图片请输入 yes，页面有图片请输入 no: `
+      );
+      if (!/^(y|yes|是|没有|无图|确认)$/i.test(recoveryAnswer.trim())) {
+        throw new DolaCliError("IMAGE_GENERATION_UNCONFIRMED", `Could not confirm an image for interrupted line ${lineNumber}.`, {
+          failedLine: lineNumber,
+          userConfirmedPageHasImage: true,
+        });
+      }
+      console.log(`[dola-cli] confirmed no image for interrupted line ${lineNumber}; opening a fresh image session`);
+      await client.send("Page.navigate", { url: args.videoGen ? DOLA_CHAT_HOME : DOLA_IMAGE_HOME });
       await waitForPageReady(client);
       await sleep(3000);
-      currentUrl = await evaluate(client, "location.href").catch(() => DOLA_IMAGE_HOME);
+      currentUrl = await evaluate(client, "location.href").catch(() => args.videoGen ? DOLA_CHAT_HOME : DOLA_IMAGE_HOME);
       await installImageHook(client);
       capturedRecords.length = 0;
       installNetworkImageCapture(client, capturedRecords);
@@ -1922,7 +2269,7 @@ async function main() {
           .map(item => normalizeImageKey(item.key || item.url))
           .filter(Boolean)
       );
-      const beforeGenerationUi = args.imageGen ? await imageGenerationUiSnapshot(client) : null;
+      const beforeGenerationUi = (args.imageGen || args.videoGen) ? await imageGenerationUiSnapshot(client) : null;
       capturedRecords.length = 0;
 
       await writeJsonFile(sessionStateFile, {
@@ -1965,20 +2312,20 @@ async function main() {
         updatedAt: new Date().toISOString(),
       });
 
-      const finalSnapshot = args.noWait || (args.imageGen && !args.noDownload)
+      const finalSnapshot = args.noWait || ((args.imageGen || args.videoGen) && !args.noDownload)
         ? await pageSnapshot(client)
         : await waitForResponseText(client, beforeResponse.textTail || "", args);
-      const downloaded = args.imageGen && !args.noWait && !args.noDownload
+      const downloaded = (args.imageGen || args.videoGen) && !args.noWait && !args.noDownload
         ? await downloadImages(
           await waitForDownloadItems(client, beforeImageUrls, capturedRecords, {
             ...args,
             beforeImageKeys,
             beforeGenerationUi,
-            watermarkFallback: Boolean(args.characterImage),
+            watermarkFallback: true,
             promptText,
           }),
           path.resolve(args.out),
-          { ...args, lineNumber, hashNaming: Boolean(args.characterImage), watermarkFallback: Boolean(args.characterImage), seenHashes }
+          { ...args, lineNumber, hashNaming: true, watermarkFallback: Boolean(args.characterImage), seenHashes }
         )
         : [];
 
@@ -2041,6 +2388,20 @@ async function main() {
           attempt = 0;
           continue;
         }
+        const missingImage = ["IMAGE_GENERATION_TIMEOUT", "IMAGE_GENERATION_NO_CLEAN_IMAGE"].includes(error.code);
+        if (missingImage && args.batchPromptFile) {
+          const answer = await askRequired(
+            `[dola-cli] 第 ${lineNumber} 条已提交，但程序没有确认最后回复中的图片。请检查 Dola 页面；确认页面确实没有图片请输入 yes，页面有图片请输入 no: `
+          );
+          if (!/^(y|yes|是|没有|无图|确认)$/i.test(answer.trim())) {
+            error.details = {
+              ...(error.details || {}),
+              failedLine: lineNumber,
+              userConfirmedPageHasImage: true,
+            };
+            throw error;
+          }
+        }
         const retryable = args.batchPromptFile && [
           "IMAGE_GENERATION_TIMEOUT",
           "IMAGE_GENERATION_NO_CLEAN_IMAGE",
@@ -2052,14 +2413,14 @@ async function main() {
           console.log(`[dola-cli] retrying line ${lineNumber} (${attempt}/${args.maxRetries}) in a new Dola tab`);
           client.close();
           capturedRecords.length = 0;
-          const retryTarget = await findOrCreateTarget(args.cdp, DOLA_IMAGE_HOME, true);
+          const retryTarget = await findOrCreateTarget(args.cdp, DOLA_CHAT_HOME, true);
           client = new CdpClient(retryTarget.webSocketDebuggerUrl);
           await client.connect();
           await client.send("Runtime.enable");
           await client.send("Page.enable");
           await client.send("Network.enable");
           await client.send("Page.bringToFront").catch(() => {});
-          currentUrl = await evaluate(client, "location.href").catch(() => DOLA_IMAGE_HOME);
+          currentUrl = await evaluate(client, "location.href").catch(() => args.videoGen ? DOLA_CHAT_HOME : DOLA_IMAGE_HOME);
           await waitForPageReady(client);
           await sleep(3000);
           await installImageHook(client);
@@ -2108,6 +2469,8 @@ async function main() {
       } : {}),
       submitted: true,
       imageGeneration: Boolean(args.imageGen),
+      videoGeneration: Boolean(args.videoGen),
+      ...(args.videoGen ? { duration: args.duration || "5", aspectRatio: args.aspectRatio || "" } : {}),
       ...results[0],
     };
   console.log(JSON.stringify(output, null, 2));
