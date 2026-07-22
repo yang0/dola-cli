@@ -2038,9 +2038,9 @@ async function main() {
     console.log(`[dola-cli] resuming remembered session ${args.session}`);
   }
   if (!args.session && !args.newChat && !args.resume) {
-    args.newChat = true;
+    args.autoSession = true;
     args.session = DOLA_CHAT_HOME;
-    console.log(`[dola-cli] no session specified; starting a new chat`);
+    console.log(`[dola-cli] no session specified; reusing an open Dola chat or creating one`);
   }
   if (args.newChat && !pendingRecoverySession) args.session = (args.imageGen && !args.characterImage) ? DOLA_IMAGE_HOME : DOLA_CHAT_HOME;
   if (activeAccount && !args.newChat && !args.session) {
@@ -2086,7 +2086,14 @@ async function main() {
   }
 
   console.log(`[dola-cli] connecting CDP ${args.cdp}`);
-  const opened = await openAccountSession(args.cdp, sessionUrl, Boolean((args.newChat || activeAccount) && !args.videoGen), args.resume, activeAccount, args.videoGen);
+  const opened = await openAccountSession(
+    args.cdp,
+    sessionUrl,
+    Boolean((args.newChat || activeAccount) && !args.videoGen && !args.autoSession),
+    args.resume,
+    activeAccount,
+    Boolean(args.videoGen || args.autoSession)
+  );
   let client = opened.client;
   let currentUrl = opened.currentUrl;
   const poolState = () => accountStateFields(accountPoolFile, activeAccount, restrictedAccounts);

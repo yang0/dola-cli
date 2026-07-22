@@ -27,8 +27,9 @@ bun src\cli.js --session "https://www.dola.com/chat/38415631468262161" --file "E
 bun src\cli.js --prompt "Hello" --no-wait
 ```
 
-When `--session` is omitted, the CLI starts a new session automatically. Use
-`--session` for an existing chat and `--resume` for a saved batch session. The
+When `--session` is omitted, the CLI reuses an open Dola chat tab when one
+exists, or creates a new session when none is open. Use `--new-chat` to force a
+new session, `--session` for an existing chat, and `--resume` for a saved batch session. The
 JSON output includes `finalUrl`, for example `https://www.dola.com/chat/<id>`.
 
 ## Video Generation
