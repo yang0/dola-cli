@@ -37,7 +37,7 @@ Usage:
 Prerequisites:
   1. Start Chrome with --remote-debugging-port=9221.
   2. Log in to https://www.dola.com manually.
-  3. Omit --session to start a new chat, or provide --session to reuse an existing chat.
+  3. Omit --session to reuse an open Dola chat or create one, or provide --session to use a specific chat.
 
 Demos:
   bun src/cli.js --session "${DEFAULT_SESSION}" --dry-run
