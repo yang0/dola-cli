@@ -1394,8 +1394,8 @@ function isAccountRestrictedError(error) {
 
 function looksLikeImageGenerationProgress(text) {
   const value = String(text || "");
-  return /generate(?:d|ing)?\s+image|will\s+generate|starting\s+to\s+generate|generating|姝ｅ湪鐢熸垚|鐢熸垚涓瓅寮€濮嬬敓鎴恷鍗冲皢鐢熸垚|璇风◢鍊檤璇风◢绛墊绋嶇瓑/i.test(value)
-    || /姝ｅ湪.*鐢熸垚|鐢熸垚.*鍥剧墖|鐢熸垚.*鍦烘櫙|姝ｅ湪涓烘偍|瑙嗛鐢熸垚.*(?:闇€瑕亅澶х害)|(?:瑙嗛|video).*(?:1\s*[-鈥搤鍒癩\s*[35]\s*(?:鍒嗛挓|minutes?)|鐢熸垚濂絴瀹屾垚鍚?.*(?:鍙戦€亅send)/i.test(value);
+  return /generate(?:d|ing)?\s+image|will\s+generate|starting\s+to\s+generate|generating/i.test(value)
+    || /video\s+generation.*(?:need|take|minute)|(?:video|video generation).*(?:generating|completed|ready|send)/i.test(value);
 }
 
 function looksLikePromptEcho(text, promptText) {
