@@ -37,7 +37,7 @@ Usage:
 Prerequisites:
   1. Start Chrome with --remote-debugging-port=9221.
   2. Log in to https://www.dola.com manually.
-  3. Use --session for an existing chat, or --new-chat for Dola chat home.
+  3. Omit --session to start a new chat, or provide --session to reuse an existing chat.
 
 Demos:
   bun src/cli.js --session "${DEFAULT_SESSION}" --dry-run
@@ -2033,9 +2033,14 @@ async function main() {
     args.session = pendingRecoverySession
       || (args.newChat ? (args.videoGen ? DOLA_CHAT_HOME : DOLA_IMAGE_HOME) : (activeAccount.session || args.session || savedState?.lastSessionUrl));
   }
-  if (!args.session && !args.newChat && savedState?.lastSessionUrl) {
+  if (!args.session && !args.newChat && args.resume && savedState?.lastSessionUrl) {
     args.session = savedState.lastSessionUrl;
     console.log(`[dola-cli] resuming remembered session ${args.session}`);
+  }
+  if (!args.session && !args.newChat && !args.resume) {
+    args.newChat = true;
+    args.session = DOLA_CHAT_HOME;
+    console.log(`[dola-cli] no session specified; starting a new chat`);
   }
   if (args.newChat && !pendingRecoverySession) args.session = (args.imageGen && !args.characterImage) ? DOLA_IMAGE_HOME : DOLA_CHAT_HOME;
   if (activeAccount && !args.newChat && !args.session) {

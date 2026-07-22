@@ -24,10 +24,12 @@ bun src\cli.js --session "https://www.dola.com/chat/38415631468262161" --file "E
 ## New Session
 
 ```powershell
-bun src\cli.js --new-chat --prompt "Hello" --no-wait
+bun src\cli.js --prompt "Hello" --no-wait
 ```
 
-The JSON output includes `finalUrl`, for example `https://www.dola.com/chat/<id>`.
+When `--session` is omitted, the CLI starts a new session automatically. Use
+`--session` for an existing chat and `--resume` for a saved batch session. The
+JSON output includes `finalUrl`, for example `https://www.dola.com/chat/<id>`.
 
 ## Video Generation
 
@@ -35,7 +37,7 @@ Generate a video with optional duration, aspect ratio, and zero or more local
 reference images. Repeat `--file`/`--attach` for multiple references:
 
 ```powershell
-bun src\cli.js --new-chat --video-gen `
+bun src\cli.js --video-gen `
   --duration 5 --aspect-ratio 16:9 `
   --file "E:\temp\first.png" --file "E:\temp\second.png" `
   --prompt "A paper boat sailing through a rainy neon city" `
